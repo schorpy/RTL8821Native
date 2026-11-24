@@ -76,6 +76,7 @@ private:
         RTLUserClient      *_userClient;
         bool                _providerOpened;
         bool                _pmInited;
+        bool                _broughtUp;
 };
 
 #endif /* _RTL8814_NATIVE_DRIVER_H */

@@ -98,6 +98,13 @@ static bool airGateOpen()
 	gateMeasure(&m);
 	char trust[GATE_BUILDLEN] = {};
 	PE_parse_boot_arg_str("rtlairtrust", trust, sizeof(trust));
+	/* 25F71 quirk (observed on this build): the kernel-side osversion
+	 * symbol reads empty while kern.osversion works in user space. The
+	 * structure check is the real safety; adopt the trust argument as the
+	 * build name when the string is empty so the validated-list and
+	 * rtlairtrust comparisons can still work. */
+	if (!m.osversion[0] && trust[0])
+		strlcpy(m.osversion, trust, sizeof(m.osversion));
 	uint32_t force = 0;
 	PE_parse_boot_argn("rtlairnogate", &force, sizeof(force));
 

@@ -98,6 +98,7 @@ struct urb {
         usb_complete_t complete;
         void *context;
         unsigned int transfer_flags;
+        unsigned int timeout_ms;        /* Compat: 0 = never; fw-dl sets 2000 */
         void *shim_priv;                /* Compat: IOUSBHostCompletion sidecar */
         volatile int inflight;          /* Compat: io() accepted, completion pending */
         volatile int done;              /* Compat: last completion ran */

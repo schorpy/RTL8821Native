@@ -51,6 +51,7 @@ enum {
     kRTLUC_AwdlSimCtl    = 12,
     kRTLUC_AwdlSimInject = 13,
     kRTLUC_AwdlSimRead   = 14,
+    kRTLUC_GetBootLog    = 15,
 };
 
 #define RX_XFER_LOG_N 16
@@ -429,8 +430,8 @@ static void run_scan(io_connect_t connect) {
         printf("[-] TriggerScan returned 0x%08x (scan may already be in progress)\n", kr);
     }
 
-    for (int i = 5; i > 0; i--) {
-        printf("    Scanning... (%d s remaining)\r", i);
+    for (int i = 15; i > 0; i--) {
+        printf("    Scanning... (%2d s remaining)\r", i);
         fflush(stdout);
         sleep(1);
     }
@@ -628,6 +629,51 @@ static void show_joinlog(io_connect_t connect) {
             printf("%8u  %-16s a=%-8d (0x%x) b=%d\n", e->t_ms - t0, nm, e->a, (unsigned)e->a, e->b);
         }
     }
+}
+
+/* ---- boot log (kRTLUC_GetBootLog): driver rtl_printk ring buffer ---- */
+#define RTL_BOOTLOG_N    4096
+#define RTL_BOOTLOG_TEXT 192
+struct rtl_bootlog_entry {
+    uint64_t t_ns;
+    uint32_t seq;
+    uint32_t len;
+    char     text[RTL_BOOTLOG_TEXT];
+};
+struct rtl_bootlog {
+    uint64_t next;
+    uint32_t pad0;
+    uint32_t pad1;
+    struct rtl_bootlog_entry e[RTL_BOOTLOG_N];
+};
+
+static void run_bootlog(io_connect_t connect) {
+    struct rtl_bootlog *log = (struct rtl_bootlog *)calloc(1, sizeof(*log));
+    if (!log) { printf("[-] no memory\n"); return; }
+    size_t sz = sizeof(*log);
+    uint64_t scalars[1] = {0};
+    uint32_t scalarCnt = 1;
+    kern_return_t kr = IOConnectCallMethod(connect, kRTLUC_GetBootLog,
+                                           NULL, 0, NULL, 0,
+                                           scalars, &scalarCnt,
+                                           log, &sz);
+    if (kr != KERN_SUCCESS) {
+        printf("[-] GetBootLog failed: 0x%08x (kext too old?)\n", kr);
+        free(log);
+        return;
+    }
+    uint64_t next = log->next;
+    uint64_t n = next < RTL_BOOTLOG_N ? next : RTL_BOOTLOG_N;
+    uint64_t t0 = n ? log->e[(next - n) % RTL_BOOTLOG_N].t_ns : 0;
+    printf("Boot log: %llu messages total (showing last %llu, ms since first shown):\n",
+           (unsigned long long)next, (unsigned long long)n);
+    for (uint64_t k = next - n; k < next; k++) {
+        struct rtl_bootlog_entry *e = &log->e[k % RTL_BOOTLOG_N];
+        if (e->seq == 0) continue;   /* not yet committed */
+        double ms = (double)(e->t_ns - t0) / 1000000.0;
+        printf("%9.1f  %s\n", ms, e->text);
+    }
+    free(log);
 }
 
 /* ---- radio ABI (kRTLUC_RadioCall -> callPlatformFunction), what the IO80211 layer will use ---- */
@@ -1153,6 +1199,8 @@ int main(int argc, char **argv) {
             printf("RF[%c][0x%02X] = 0x%05X\n", 'A' + (int)path, reg, v);
     } else if (strcmp(argv[1], "joinlog") == 0) {
         show_joinlog(connect);
+    } else if (strcmp(argv[1], "bootlog") == 0) {
+        run_bootlog(connect);
     } else if (strcmp(argv[1], "knob") == 0 && argc >= 4) {
         /* knob 1 <0|1|255>: RX A-MPDU accept. knob 2 <0|1>: protect robust management frames we send. */
         uint64_t in[2] = { strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0) };

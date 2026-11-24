@@ -216,10 +216,22 @@ bool RTL8814Native::startLocked(IOService *provider)
                 goto fail;
         }
         if (probe_rc != 0) {
-                IOLog("RTL8814Native: vendor radio probe returned %d\n", probe_rc);
-        } else {
-                IOLog("RTL8814Native: vendor radio probe succeeded\n");
+                /* Publish the service anyway (degraded mode, no ethernet
+                 * interface, no RX/TX) so Tools/test_uc can reach the kext
+                 * globals: bootlog, telemetry, joinlog — otherwise every
+                 * failed bring-up is invisible and undiagnosable. */
+                IOLog("RTL8814Native: vendor radio probe returned %d — degraded start (diagnostics only)\n", probe_rc);
+                rtl8814native_set_netdev(nullptr);
+                _adapter->release();
+                _adapter = nullptr;
+                _broughtUp = false;
+
+                registerService();
+                IOLog("RTL8814Native: degraded service published (use test_uc bootlog)\n");
+                return true;
         }
+        IOLog("RTL8814Native: vendor radio probe succeeded\n");
+        _broughtUp = true;
 
         /* Now attach and start adapter: publishes interface with real factory MAC */
         if (!_adapter->attach(this) || !_adapter->start(this)) {

@@ -647,6 +647,141 @@ IOReturn RTLAirInterface::setWCL_SCAN_REQ(apple80211ScanRequest *req)
 	return k ? _ctrl->startScan(ch, k) : _ctrl->startScan();
 }
 
+
+/* =====================================================================
+ * WPA2 passphrase -> PMK derivation (PBKDF2-SHA1, 4096 iterations).
+ * Adapted from Source/Driver/WPA2Supplicant.c (same GPL-2.0 project).
+ * airportd hands the raw passphrase (keyLen = passphrase length) on a
+ * first-time WPA2-PSK join; the radio's supplicant takes only the PMK.
+ * ===================================================================== */
+namespace {
+struct RtlSha1Ctx {
+	uint32_t state[5];
+	uint64_t count;
+	uint8_t  buffer[64];
+};
+
+inline uint32_t rtlRol32(uint32_t val, int bits)
+{
+	return (val << bits) | (val >> (32 - bits));
+}
+
+void rtlSha1Transform(uint32_t state[5], const uint8_t buffer[64])
+{
+	uint32_t w[80];
+	uint32_t a, b, c, d, e;
+
+	for (int i = 0; i < 16; i++)
+		w[i] = ((uint32_t)buffer[i * 4 + 0] << 24) |
+		       ((uint32_t)buffer[i * 4 + 1] << 16) |
+		       ((uint32_t)buffer[i * 4 + 2] << 8)  |
+		       ((uint32_t)buffer[i * 4 + 3]);
+	for (int i = 16; i < 80; i++)
+		w[i] = rtlRol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+	a = state[0]; b = state[1]; c = state[2]; d = state[3]; e = state[4];
+	for (int i = 0; i < 80; i++) {
+		uint32_t f, k;
+		if (i < 20)      { f = (b & c) | ((~b) & d);            k = 0x5A827999; }
+		else if (i < 40) { f = b ^ c ^ d;                       k = 0x6ED9EBA1; }
+		else if (i < 60) { f = (b & c) | (b & d) | (c & d);      k = 0x8F1BBCDC; }
+		else             { f = b ^ c ^ d;                       k = 0xCA62C1D6; }
+		uint32_t temp = rtlRol32(a, 5) + f + e + k + w[i];
+		e = d; d = c; c = rtlRol32(b, 30); b = a; a = temp;
+	}
+	state[0] += a; state[1] += b; state[2] += c; state[3] += d; state[4] += e;
+}
+
+void rtlSha1Init(RtlSha1Ctx *ctx)
+{
+	ctx->state[0] = 0x67452301;
+	ctx->state[1] = 0xEFCDAB89;
+	ctx->state[2] = 0x98BADCFE;
+	ctx->state[3] = 0x10325476;
+	ctx->state[4] = 0xC3D2E1F0;
+	ctx->count = 0;
+}
+
+void rtlSha1Update(RtlSha1Ctx *ctx, const uint8_t *data, size_t len)
+{
+	size_t idx = (size_t)(ctx->count & 0x3F);
+	ctx->count += len;
+	if (idx) {
+		size_t left = 64 - idx;
+		if (len < left) { memcpy(ctx->buffer + idx, data, len); return; }
+		memcpy(ctx->buffer + idx, data, left);
+		rtlSha1Transform(ctx->state, ctx->buffer);
+		data += left; len -= left;
+	}
+	while (len >= 64) { rtlSha1Transform(ctx->state, data); data += 64; len -= 64; }
+	if (len) memcpy(ctx->buffer, data, len);
+}
+
+void rtlSha1Final(RtlSha1Ctx *ctx, uint8_t digest[20])
+{
+	uint64_t bits = ctx->count * 8;
+	uint8_t pad = 0x80, zero = 0x00, len_be[8];
+
+	for (int i = 0; i < 8; i++) len_be[7 - i] = (uint8_t)(bits >> (i * 8));
+	rtlSha1Update(ctx, &pad, 1);
+	while ((ctx->count & 0x3F) != 56) rtlSha1Update(ctx, &zero, 1);
+	rtlSha1Update(ctx, len_be, 8);
+	for (int i = 0; i < 5; i++) {
+		digest[i * 4 + 0] = (uint8_t)(ctx->state[i] >> 24);
+		digest[i * 4 + 1] = (uint8_t)(ctx->state[i] >> 16);
+		digest[i * 4 + 2] = (uint8_t)(ctx->state[i] >> 8);
+		digest[i * 4 + 3] = (uint8_t)(ctx->state[i]);
+	}
+	volatile uint8_t *zp = (volatile uint8_t *)ctx;
+	for (size_t i = 0; i < sizeof(*ctx); i++) zp[i] = 0;
+}
+
+void rtlHmacSha1(const uint8_t *key, size_t keyLen,
+                 const uint8_t *data, size_t dataLen, uint8_t mac[20])
+{
+	RtlSha1Ctx ctx;
+	uint8_t kIpad[64], kOpad[64], tk[20], inner[20];
+
+	memset(tk, 0, sizeof(tk));
+	if (keyLen > 64) {
+		rtlSha1Init(&ctx); rtlSha1Update(&ctx, key, keyLen);
+		rtlSha1Final(&ctx, tk);
+		key = tk; keyLen = 20;
+	}
+	memset(kIpad, 0x36, 64); memset(kOpad, 0x5c, 64);
+	for (size_t i = 0; i < keyLen; i++) { kIpad[i] ^= key[i]; kOpad[i] ^= key[i]; }
+
+	rtlSha1Init(&ctx); rtlSha1Update(&ctx, kIpad, 64);
+	rtlSha1Update(&ctx, data, dataLen); rtlSha1Final(&ctx, inner);
+	rtlSha1Init(&ctx); rtlSha1Update(&ctx, kOpad, 64);
+	rtlSha1Update(&ctx, inner, 20); rtlSha1Final(&ctx, mac);
+	memset(kIpad, 0, sizeof(kIpad)); memset(kOpad, 0, sizeof(kOpad));
+	memset(tk, 0, sizeof(tk)); memset(inner, 0, sizeof(inner));
+}
+
+void rtlPbkdf2Sha1(const uint8_t *passphrase, size_t passLen,
+                   const uint8_t *ssid, size_t ssidLen, uint8_t pmk[32])
+{
+	uint8_t saltBlk[40], u[20], t[20];
+	if (ssidLen > 32) ssidLen = 32;
+
+	for (uint32_t blk = 1; blk <= 2; blk++) {
+		memcpy(saltBlk, ssid, ssidLen);
+		saltBlk[ssidLen + 0] = 0; saltBlk[ssidLen + 1] = 0;
+		saltBlk[ssidLen + 2] = 0; saltBlk[ssidLen + 3] = (uint8_t)blk;
+
+		rtlHmacSha1(passphrase, passLen, saltBlk, ssidLen + 4, u);
+		memcpy(t, u, 20);
+		for (int iter = 1; iter < 4096; iter++) {
+			rtlHmacSha1(passphrase, passLen, u, 20, u);
+			for (int j = 0; j < 20; j++) t[j] ^= u[j];
+		}
+		if (blk == 1) memcpy(pmk, t, 20);
+		else          memcpy(pmk + 20, t, 12);
+	}
+}
+} /* namespace */
+
 /* apple80211AssocCandidates, see Docs/PHASE5_IO80211.md for the offsets. */
 IOReturn RTLAirInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *cand)
 {
@@ -688,6 +823,18 @@ IOReturn RTLAirInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *cand)
 	} else if (keyLen == 32) {
 		j.has_pmk = 1;
 		memcpy(j.pmk, key + 16, 32);
+	} else if (keyLen >= 8 && keyLen <= 63) {
+		/* First-time WPA2-PSK join: airportd hands the raw passphrase
+		 * (keyLen = its length, data at key + 16). Derive the PMK here
+		 * with PBKDF2-SHA1 (4096 iterations, SSID as salt) — the same
+		 * derivation the radio supplicant and test_uc perform — and
+		 * hand has_pmk to the radio. The passphrase buffer is wiped. */
+		uint8_t derivedPmk[32];
+		rtlPbkdf2Sha1((const uint8_t *)key + 16, keyLen, j.ssid, j.ssid_len, derivedPmk);
+		j.has_pmk = 1;
+		memcpy(j.pmk, derivedPmk, 32);
+		memset(derivedPmk, 0, sizeof(derivedPmk));
+		LOG("associate: derived PMK from %u-byte passphrase (PBKDF2-SHA1)", keyLen);
 	} else if (keyLen != 0) {
 		LOG("associate: key length %u is not a PMK, unsupported", keyLen);
 		return kIOReturnUnsupported;
@@ -963,9 +1110,30 @@ IOReturn RTLAirInterface::setWCL_UPDATE_FAST_LANE(apple80211_fastlane *)
  */
 uintptr_t RTLAirInterface::setMacAddress(mloAddrArray &addrs)
 {
-	STUB_ENTER();
+	/* WCL sends the per-network private address here before every join.
+	 * Store it in the interface's IOMACAddress property: syncMac() (which
+	 * startJoin runs while the radio is idle) then moves the radio to it,
+	 * so macOS's view, the interface property and the over-the-air MAC all
+	 * agree. With Private Address OFF WCL never calls this and the radio
+	 * keeps its hardware address — both identities are now consistent. */
 	const uint8_t *m = (const uint8_t *)&addrs;
-	LOG("set MAC %02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+	bool valid = m && !(m[0] & 1) &&
+	    (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]);
+	if (!valid) {
+		LOG("set MAC: invalid address, ignored");
+		return kIOReturnBadArgument;
+	}
+	uint8_t cur[6];
+	if (_ctrl) {
+		struct rtl_radio_status st;
+		_ctrl->radioStatus(&st);
+		if (!memcmp(st.bssid, m, 6) && st.state == RTL_RADIO_S_IDLE) {
+			LOG("set MAC %02x:%02x:%02x:%02x:%02x:%02x: already the radio's", m[0], m[1], m[2], m[3], m[4], m[5]);
+			return 0;
+		}
+	}
+	setProperty("IOMACAddress", (void *)m, 6);
+	LOG("set MAC %02x:%02x:%02x:%02x:%02x:%02x stored (applied at the next join)", m[0], m[1], m[2], m[3], m[4], m[5]);
 	return 0;
 }
 
@@ -2163,9 +2331,14 @@ IOReturn RTLAirController::getCARD_CAPABILITIES(IO80211SkywalkInterface *, apple
 	 * (Docs/AWDL_SECUENCIA_CON_INFRA.md, section 4.2). */
 	p[7] |= 0x20;
 	/* airportd refuses WPA3-only networks unless capability 75 is present
-	 * (userspace byte 9 bit 3, kernel p[13] bit 3). Experiment: this makes
-	 * macOS ask for SAE on transition networks too. */
-	p[13] |= 0x08;
+	 * (userspace byte 9 bit 3, kernel p[13] bit 3). KEEP CLEAR until real
+	 * SAE (Dragonfly) exists in the radio: advertising it makes macOS
+	 * request SAE on WPA2/WPA3 transition networks, and the radio's SAE
+	 * placeholder returns unsupported — the join dies before the driver
+	 * ever sees it (observed: rn9p join with the hardware-MAC identity
+	 * picked SAE and failed with 'wrong password', while the WPA2-PSK
+	 * path with PBKDF2 PMK derivation works). */
+	/* p[13] |= 0x08; */
 	/* Apple80211IsAuthSelAllowed also needs the PMF capability: _getMFPCaps
 	 * reports "no PMF" unless userspace byte 6 has bit 0 or 4 (kernel p[10]).
 	 * Broadcom sets 0x10 when its firmware supports management frame protection. */
@@ -2528,14 +2701,17 @@ void RTLAirController::poll()
 			reportJoin(true, &st);
 			if (!next)
 				next = 1000;
-		} else if (joinTicks >= 80) {        /* 20 s, as test_uc join */
+		} else if (joinTicks >= 180) {       /* 45 s: APs can ignore a
+			 * client for 30-60 s after a stale association
+			 * (DrogaBox README); the old 20 s cap failed joins
+			 * against such APs. */
 			reportJoin(false, &st);
 		} else {
 			/* rtw_set_802_11_connect reports success without joining while
 			 * the radio is still under linking, and a join it deferred to a
 			 * scan can be lost: an idle radio 3 s in gets the join again. */
 			if ((dropped || joinTicks % 12 == 0) && st.state == RTL_RADIO_S_IDLE &&
-			    !st.scanning && _joinRetries < 2)
+			    !st.scanning && _joinRetries < 5)
 				retryJoin();
 			next = 250;
 		}
@@ -2552,11 +2728,11 @@ void RTLAirController::poll()
 			reportRoam(true, &st);
 			if (!next)
 				next = 1000;
-		} else if (joinTicks >= 80) {
+		} else if (joinTicks >= 180) {
 			reportRoam(false, &st);
 		} else {
 			if ((dropped || joinTicks % 12 == 0) && st.state == RTL_RADIO_S_IDLE &&
-			    !st.scanning && _joinRetries < 2)
+			    !st.scanning && _joinRetries < 5)
 				retryJoin();
 			next = 250;
 		}

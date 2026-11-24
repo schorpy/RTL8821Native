@@ -8,6 +8,7 @@
  */
 
 #include <drv_types.h>
+#include <hal_com_reg.h>
 #include <usb_ops.h>
 #include <hal_data.h>
 #include <hal_intf.h>
@@ -17,6 +18,10 @@
 #include "WPA2Supplicant.h"
 #include "RTLRadioABI.h"
 
+#include <rtw_btcoex.h>
+
+extern int rtw_halmac_rx_agg_switch(struct dvobj_priv *d, u8 enable);
+
 extern struct rtl8814_rx_log g_rx_log;
 extern struct rtl_jlog g_jlog;
 
@@ -24,8 +29,15 @@ void rtl8814native_get_join_log(struct rtl_jlog *out)
 {
 	_rtw_memcpy(out, &g_jlog, sizeof(*out));
 }
+void rtl8814native_get_bootlog(struct rtl_bootlog *out)
+{
+	rtl_bootlog_get(out);
+}
+extern volatile uint32_t g_rx_urb_submit_ok;
+extern volatile uint32_t g_rx_urb_submit_err;
 extern u8 rtl8814native_awdl_backop;
 extern volatile uint32_t g_rx_reassemble;
+extern volatile uint32_t g_rx_parse_knob;
 extern volatile uint32_t g_rx_skb_recycle;
 static uint32_t g_bulk_in_mps;
 static uint32_t g_usb_switch;   /* RTL_USB_SWITCH_*; survives re-probe, reset on kext load */
@@ -68,6 +80,22 @@ static void rtl8814_tx_work_fn(struct work_struct *w)
 		if (!g_padapter || !g_padapter->bup || RTW_CANNOT_TX(g_padapter)) {
 			dev_kfree_skb_any(skb);
 			continue;
+		}
+		/* RTL8821Native: duplicate broadcast data frames (DHCP DISCOVER,
+		 * ARP request, ICMP group). They are single-shot — no ACK, no
+		 * retry ladder — and die in a coex BT slot or at a marginal
+		 * rate, which is exactly how DHCP failed: DISCOVERs visible in
+		 * tcpdump, OFFER never heard. A second copy doubles the
+		 * delivery odds for ~34 bytes of radio time. */
+		if (skb->len >= 6 && skb->data &&
+		    skb->data[0] == 0xff && skb->data[1] == 0xff &&
+		    skb->data[2] == 0xff && skb->data[3] == 0xff &&
+		    skb->data[4] == 0xff && skb->data[5] == 0xff) {
+			struct sk_buff *dup = skb_copy(skb, GFP_ATOMIC);
+			if (dup) {
+				dup->dev = skb->dev;
+				_rtw_xmit_entry(dup, g_padapter->pnetdev);
+			}
 		}
 		_rtw_xmit_entry(skb, g_padapter->pnetdev);
 	}
@@ -229,6 +257,13 @@ u8 rtw_init_drv_sw(_adapter *padapter)
 	rtw_init_pwrctrl_priv(padapter);
 	rtw_hal_dm_init(padapter);
 
+	/* Linux os_intfs.c:3016-3017 — populate rfctl->channel_set and
+	 * channel_list from the channel plan. Omitted by the port, leaving
+	 * max_chan_nums=0: scans ran with an empty channel list and finished
+	 * instantly with 0 networks. */
+	if (is_primary_adapter(padapter))
+		rtw_rfctl_chplan_init(padapter);
+
 #ifdef DBG_CONFIG_ERROR_DETECT
 	rtw_hal_sreset_init(padapter);
 #endif
@@ -319,8 +354,6 @@ uint loadparam(_adapter *padapter)
 	registry_par->vht_rx_mcs_map[1] = 0xaa;
 
 	/* Realtek RF, RFE, Channel Plan & PhyDM/HALRF Abilities */
-	registry_par->lowrate_two_xmit = 1;
-	registry_par->rf_path = RF_TYPE_MAX;
 	registry_par->tx_nss = 0;
 	registry_par->rx_nss = 0;
 	_rtw_memset(registry_par->alpha2, 0xFF, 2);
@@ -331,7 +364,6 @@ uint loadparam(_adapter *padapter)
 	registry_par->drv_ant_band_switch = 1;
 	registry_par->hwpdn_mode = 2;
 	registry_par->hw_wps_pbc = 1;
-	registry_par->max_roaming_times = 2;
 	registry_par->pll_ref_clk_sel = CONFIG_RTW_PLL_REF_CLK_SEL;
 	registry_par->RegEnableTxPowerLimit = CONFIG_TXPWR_LIMIT_EN;
 	registry_par->RegEnableTxPowerByRate = CONFIG_TXPWR_BY_RATE_EN;
@@ -345,7 +377,12 @@ uint loadparam(_adapter *padapter)
 	registry_par->GLNA_Type = 0;
 	registry_par->phydm_ability = 0xffffffff;
 	registry_par->halrf_ability = 0xffffffff;
-	registry_par->switch_usb_mode = 1; /* U2 -> U3 (hal HW_VAR_USB_MODE) */
+	registry_par->switch_usb_mode = 0; /* RTL8821CU is USB 2.0 High-Speed only */
+
+	/* RX pipe sizing — the vendor loadparam sets this from the module
+	 * param default; the port's loadparam replaces that path, so set it
+	 * explicitly or inirp_init submits zero RX URBs. */
+	registry_par->recvbuf_nr = NR_RECVBUFF;
 
 	return _SUCCESS;
 }
@@ -428,8 +465,8 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 
 	/* 2. Configure USB transport & Chip Identity on dvobj */
 	g_dvobj->interface_type = RTW_USB;
-	g_dvobj->chip_type = RTL8814A;
-	g_dvobj->HardwareType = HARDWARE_TYPE_RTL8814AU;
+	g_dvobj->chip_type = RTL8821C;
+	g_dvobj->HardwareType = HARDWARE_TYPE_RTL8821CU;
 	g_dvobj->pusbdev = udev;
 	g_dvobj->usb_speed = RTW_USB_SPEED_2; /* refined below from the bulk IN wMaxPacketSize */
 	_rtw_init_sema(&(g_dvobj->usb_suspend_sema), 0);
@@ -511,9 +548,9 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 	}
 
 	/* 5. Smoke test: read chip version register (REG_SYS_CFG = 0x00F0) */
-	val32 = rtw_read32(g_padapter, REG_SYS_CFG);
+	val32 = rtw_read32(g_padapter, REG_SYS_CFG1_8821C);
 	g_radio_telem.reg_sys_cfg = val32;
-	rtl_printk("RTL8814Native: [Register I/O Smoke Test] REG_SYS_CFG = 0x%08X\n", val32);
+	rtl_printk("RTL8814Native: [Register I/O Smoke Test] REG_SYS_CFG1 = 0x%08X\n", val32);
 
 	/* Read chip version into HalData */
 	rtw_hal_read_chip_version(g_padapter);
@@ -522,7 +559,7 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 		g_radio_telem.chip_type = pHalData->version_id.ICType;
 		g_radio_telem.cut_version = pHalData->version_id.CUTVersion;
 		rtl_printk("RTL8814Native: Chip ICType = %d (8814A=%d), CUTVersion = %d\n",
-			   pHalData->version_id.ICType, CHIP_8814A,
+			   pHalData->version_id.ICType, CHIP_8821C,
 			   pHalData->version_id.CUTVersion);
 	}
 
@@ -536,32 +573,6 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 		rtl_printk("RTL8814Native: rtw_hal_read_chip_info returned %d\n", status);
 	}
 
-	/* 7b. USB 2.0 -> 3.0 mode switch, as Linux usb_reprobe_switch_usb_mode()
-	 * does right after reading the efuse. In HS the HAL arms the chip for SS
-	 * and writes 0x05=0x80 (USB disconnect); the chip re-enumerates on the
-	 * SuperSpeed lanes and a new kext instance probes it. In SS it clears
-	 * the switch bits. ISSUED is kept for the kext's lifetime so that a chip
-	 * which falls back to HS is brought up in HS instead of looping. */
-	if (pHalData && pHalData->EEPROMUsbSwitch) {
-		g_usb_switch |= RTL_USB_SWITCH_EFUSE_OK;
-		if (IS_SUPER_SPEED_USB(g_padapter)) {
-			u8 unused = _FALSE;
-			rtw_hal_set_hwreg(g_padapter, HW_VAR_USB_MODE, &unused);
-			g_usb_switch |= RTL_USB_SWITCH_SS_FINALIZED;
-			rtl_printk("RTL8814Native: running in USB 3.0 mode\n");
-		} else if (IS_HIGH_SPEED_USB(g_padapter) && !(g_usb_switch & RTL_USB_SWITCH_ISSUED)) {
-			u8 disconnected = _FALSE;
-			g_usb_switch |= RTL_USB_SWITCH_ISSUED;
-			rtw_hal_set_hwreg(g_padapter, HW_VAR_USB_MODE, &disconnected);
-			if (disconnected) {
-				rtl_printk("RTL8814Native: switching to USB 3.0, device will re-enumerate\n");
-				rtl8814_free_partial_probe();
-				g_radio_telem.probe_status = RTL_PROBE_USB3_SWITCH;
-				return RTL_PROBE_USB3_SWITCH;
-			}
-		}
-	}
-
 	/* 7c. A warm restart leaves the dongle powered (VBUS stays up) with the
 	 * MAC/BB/RF still running from the previous session. The vendor power-on
 	 * flow only logs "MAC has already power on" and then runs LCK/IQK on the
@@ -570,7 +581,7 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 	 * cold boot. Power the chip off first, as rtw88 does
 	 * (rtw_mac_power_on: -EALREADY -> power off -> power on). */
 	{
-		u8 clkr = rtw_read8(g_padapter, REG_SYS_CLKR + 1);
+		u8 clkr = rtw_read8(g_padapter, REG_SYS_CLK_CTRL_8821C + 1);
 		u8 cr = rtw_read8(g_padapter, REG_CR);
 		u32 off = 0;
 
@@ -579,7 +590,7 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 			off = 1;
 		}
 		g_rate_diag.warm_start = clkr | ((u32)cr << 8) | (off << 16);
-		rtl_printk("RTL8814Native: probe power state SYS_CLKR+1=0x%02x CR=0x%02x -> %s\n",
+		rtl_printk("RTL8814Native: probe power state SYS_CLK_CTRL+1=0x%02x CR=0x%02x -> %s\n",
 			   clkr, cr, off ? "warm start, chip powered off before HAL init" : "cold");
 	}
 
@@ -614,6 +625,21 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 	}
 
 	/* 10. Hardware initialization and Firmware Download */
+	/* Linux rtw_drv_init (usb_intf.c:1133-1134) calls BOTH coex inits.
+	 * The full FW-side 1ant coexistence REGRESSED the native UI on the
+	 * port (Wi-Fi toggle dead) — reverted. The gate below only matters
+	 * when CONFIG_BT_COEXIST is re-defined for an experimental build. */
+#ifdef CONFIG_BT_COEXIST
+	{
+		uint32_t coex = 0;
+		PE_parse_boot_argn("rtlbtcoex", &coex, sizeof(coex));
+		if (coex == 1) {
+			rtw_btcoex_Initialize(g_padapter);
+			rtl_printk("RTL8814Native: full BT coexistence initialized (rtlbtcoex=1)\n");
+		}
+	}
+#endif
+	rtw_btcoex_wifionly_initialize(g_padapter);
 	rtl_printk("RTL8814Native: initializing HAL and downloading firmware...\n");
 	status = rtw_hal_init(g_padapter);
 	g_radio_telem.hal_init_status = status;
@@ -621,8 +647,51 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 		g_radio_telem.fw_ready = (pHalData && pHalData->bFWReady) ? 1 : 0;
 		rtl_printk("RTL8814Native: rtw_hal_init & firmware download SUCCEEDED! (fw_ready=%d)\n",
 			   g_radio_telem.fw_ready);
+		/* RTL8821Native: the chip runs USB burst packing by design; with
+		 * rx-agg NONE the packing is unbounded and packets straddle our
+		 * 32KB buffers — the next transfer starts mid-packet, the parse
+		 * reads payload as descriptors (RXBAD hexdumps confirmed: ASCII
+		 * text parsed as MACs), frames drop, pings lose 10-40%.
+		 * Use the VENDOR DEFAULT (USB agg, halmac defaults): the packing
+		 * is bounded so transfers never split packets — the exact
+		 * configuration Linux phones run this parse loop against. */
+		{
+			HAL_DATA_TYPE *hal = GET_HAL_DATA(g_padapter);
+			hal->rxagg_mode = RX_AGG_USB;
+			hal->rxagg_usb_size = 0;      /* halmac defaults */
+			hal->rxagg_usb_timeout = 0;
+		}
+		rtw_halmac_rx_agg_switch(adapter_to_dvobj(g_padapter), _TRUE);
+		rtl_printk("RTL8814Native: RX agg = vendor default (USB mode, bounded), AGG_PG_TH=0x%08x\n",
+			   rtw_read32(g_padapter, REG_RXDMA_AGG_PG_TH));
+
+		/* RX reassembly ON (the original keeps it optional; the 8814AU
+		 * chip doesn't straddle by default, but our 8821CU does — 41+
+		 * RXBAD events captured with payload parsed as descriptors
+		 * after packets straddled the 32KB transfer boundaries).
+		 * Stash the tail, rejoin it to the next transfer's head. */
+		g_rx_reassemble = 1;
+		rtl_printk("RTL8814Native: RX reassembly ON (straddle carry)\n");
+
+		/* Coexistence default = data-first TDMA (knob 10 mode 4, 55 ms
+		 * Wi-Fi / 10 ms BT): measured 0% ping loss and fast browsing;
+		 * the plain wifi-only lock (0x10000077) measured 10-40% loss
+		 * with 1.8-4.5 s retransmission RTTs. The FW-side coex stack
+		 * regressed the native UI and stays off (rtlbtcoex=1 gate).
+		 * knob 10 overrides at runtime. */
+		rtl8814native_set_knob(10, 4);
+
+		/* RX A-MPDU aggregation OFF by default: on a lossy link the
+		 * reorder buffer head-of-line blocks TCP page loads (measured
+		 * "RX A-MPDU off -> HTTP 1.2 s vs 4.2 s"; 1534 frames stalled
+		 * in reorder in one session). Pings don't trigger it, which is
+		 * why ping loss looked fine while browsing crawled. knob 4 0
+		 * re-enables at runtime for experiments. */
+		rtl8814native_set_knob(4, 1);
 	} else {
-		rtl_printk("RTL8814Native: rtw_hal_init returned status %d\n", status);
+		rtl_printk("RTL8814Native: rtw_hal_init returned status %d — aborting bring-up (no fw, no RX arming)\n", status);
+		g_radio_telem.probe_status = -70;
+		return -EIO;
 	}
 
 	/* 11. Start Driver Threads (RTW_CMD_THREAD) and USB Bulk IN RX IRPs */
@@ -637,6 +706,11 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 	}
 
 	rtw_intf_start(g_padapter);
+	rtl_printk("RTL8814Native: intf_start done: rx_submit ok=%u err=%u disable_func=0x%x drv_stopped=%d surprise=%d\n",
+		   g_rx_urb_submit_ok, g_rx_urb_submit_err,
+		   ATOMIC_READ(&adapter_to_dvobj(g_padapter)->disable_func),
+		   rtw_is_drv_stopped(g_padapter) ? 1 : 0,
+		   rtw_is_surprise_removed(g_padapter) ? 1 : 0);
 
 	g_padapter->bup = _TRUE;
 	g_padapter->net_closed = _FALSE;
@@ -783,7 +857,7 @@ int rtl8814native_vendor_resume(void)
 	/* Same warm-start guard as probe step 7c: calibrating on a live chip
 	 * ruins the link (Milestone 4.4) */
 	{
-		u8 clkr = rtw_read8(g_padapter, REG_SYS_CLKR + 1);
+		u8 clkr = rtw_read8(g_padapter, REG_SYS_CLK_CTRL_8821C + 1);
 		u8 cr = rtw_read8(g_padapter, REG_CR);
 		if ((clkr & BIT3) && cr != 0 && cr != 0xEA)
 			rtw_hal_power_off(g_padapter);
@@ -810,6 +884,11 @@ int rtl8814native_vendor_resume(void)
 		rtl_printk("RTL8814Native: wake: rtw_start_drv_threads failed\n");
 
 	rtw_intf_start(g_padapter);
+	rtl_printk("RTL8814Native: wake intf_start done: rx_submit ok=%u err=%u disable_func=0x%x drv_stopped=%d surprise=%d\n",
+		   g_rx_urb_submit_ok, g_rx_urb_submit_err,
+		   ATOMIC_READ(&adapter_to_dvobj(g_padapter)->disable_func),
+		   rtw_is_drv_stopped(g_padapter) ? 1 : 0,
+		   rtw_is_surprise_removed(g_padapter) ? 1 : 0);
 
 	g_padapter->bup = _TRUE;
 	g_padapter->net_closed = _FALSE;
@@ -981,8 +1060,144 @@ int rtl8814native_join_network(const char *ssid_str, const char *psk_str, uint32
 
 /* Live experiments from Tools/test_uc (kRTLUC_SetKnob). 1: RX A-MPDU accept (0 off, 1 on, 255 auto).
  * 2: protect robust management frames we send (0 off, 1 on). */
-int rtl8814native_set_knob(uint32_t knob, uint32_t value)
+/* Coexistence TDMA state (knob 10 mode 3): flips the RF front-end grant
+ * register 0x38 between the Wi-Fi and Bluetooth slots so both radios share
+ * the single antenna. Choreography from Zerotix99/RTL8821CU-macOS-Coexistence. */
+static struct timer_list g_coex_tdma_timer;
+static volatile int g_coex_tdma_active;
+static volatile int g_coex_tdma_inited;
+static volatile int g_coex_tdma_phase;
+static volatile int g_coex_tdma_bt_ms = 10;
+
+/* RTL8821Native: host-side rate adaptation inputs (DrogaBox/rtw88 method —
+ * per-frame CCX TX reports, NOT the firmware's blind RA). knob 11 enables
+ * SPE_RPT on unicast data frames; c2h_ccx_rpt counts the reports here. */
+void rtl8814native_note_ccx_report(u8 rate, u8 retry, u8 state);
+
+volatile int g_ccx_data_rpt_enable;
+
+int rtl8814native_ccx_data_rpt_enabled(void)
 {
+	return g_ccx_data_rpt_enable;
+}
+static volatile uint32_t g_ccx_rpt_cnt;
+static volatile uint32_t g_ccx_rpt_ok;
+static volatile uint32_t g_ccx_rpt_retry;
+static volatile uint32_t g_ccx_rpt_fail;
+static volatile uint8_t g_ccx_rpt_last_rate;
+static volatile uint8_t g_ccx_rpt_last_retry;
+
+/* Per-rate counters for the host ladder: HW (DESC) rate index -> ok/fail */
+#define CCX_RATE_TBL_MAX 64
+static volatile uint32_t g_ccx_rate_ok[CCX_RATE_TBL_MAX];
+static volatile uint32_t g_ccx_rate_fail[CCX_RATE_TBL_MAX];
+
+void rtl8814native_note_ccx_report(u8 rate, u8 retry, u8 state)
+{
+	g_ccx_rpt_cnt++;
+	if (state == 0)
+		g_ccx_rpt_ok++;
+	else if (state == 1)
+		g_ccx_rpt_retry++;
+	else
+		g_ccx_rpt_fail++;
+	if (rate < CCX_RATE_TBL_MAX) {
+		if (state == 0)
+			g_ccx_rate_ok[rate]++;
+		else
+			g_ccx_rate_fail[rate]++;
+	}
+	g_ccx_rpt_last_rate = rate;
+	g_ccx_rpt_last_retry = retry;
+}
+
+/* RSSI-based TX rate cap: the firmware rate adapter runs blind (no TX
+ * feedback — C2H_RA_RPT never arrives), so it parks at MCS7 where frames
+ * fail heavily at moderate distance. Capped at OFDM 24M the link is
+ * loss-free (measured); engage below -60 dBm, release above -55 dBm.
+ * knob 6 (fix_rate) overrides: any manual value clears the cap.
+ * When CCX data reports are enabled (knob 11), the counters below feed a
+ * future host-side ladder (DrogaBox/rtw88 method). */
+static volatile int g_rate_cap_active;
+
+void rtl8814native_rate_cap_tick(void)
+{
+	_adapter *a = g_padapter;
+	s32 rssi;
+
+	if (!a || !(get_fwstate(&a->mlmepriv) & _FW_LINKED))
+		return;
+
+	rssi = a->mlmepriv.cur_network.network.Rssi;
+
+	/* Host-side rate ladder (DrogaBox/rtw88 method): when CCX data
+	 * reports are on, fix_rate is stepped by MEASURED per-rate success
+	 * — up when the current rate is clean, down when it fails. The
+	 * ladder owns fix_rate; the RSSI cap is bypassed while active. */
+	if (g_ccx_data_rpt_enable && g_ccx_rpt_cnt > 20) {
+		/* MGN->HW(DESC) code: OFDM6M=4..54M=11, MCS0=12..MCS7=19.
+		 * Walk window [DESC24M(8) .. DESC54M(11)] — conservative. */
+		static const u8 ladder[3] = { 8, 10, 11 };  /* 24M, 48M, 54M */
+		static int idx = 0, stable = 0;
+		u32 ok = g_ccx_rate_ok[ladder[idx]];
+		u32 fail = g_ccx_rate_fail[ladder[idx]];
+
+		if (fail == 0 && ok >= 15 && idx < 2) {
+			stable++;
+			if (stable >= 3) {           /* ~3 clean windows */
+				idx++;
+				stable = 0;
+				a->fix_rate = hw_rate_to_m_rate(ladder[idx]);
+				g_rate_cap_active = 1;
+				rtl_printk("RTL8814Native: ccx ladder UP -> hw%d (ok=%u fail=%u)\n",
+					   ladder[idx], ok, fail);
+			}
+		} else if (fail > 3 && idx > 0) {
+			idx--;
+			stable = 0;
+			a->fix_rate = hw_rate_to_m_rate(ladder[idx]);
+			rtl_printk("RTL8814Native: ccx ladder DOWN -> hw%d (ok=%u fail=%u)\n",
+				   ladder[idx], ok, fail);
+		} else if (ok < 5 && fail == 0) {
+			/* quiet window — reset the stability counter */
+			stable = 0;
+		}
+		return;
+	}
+
+	if (!g_rate_cap_active && a->fix_rate == 0xFF && rssi <= -60) {
+		a->fix_rate = MGN_24M;
+		g_rate_cap_active = 1;
+		rtl_printk("RTL8814Native: rate cap ON (rssi %d dBm -> 24M)\n", rssi);
+	} else if (g_rate_cap_active && rssi >= -55) {
+		a->fix_rate = 0xFF;
+		g_rate_cap_active = 0;
+		rtl_printk("RTL8814Native: rate cap OFF (rssi %d dBm -> auto)\n", rssi);
+	}
+}
+
+static void rtl8814_coex_tdma_tick(unsigned long ctx)
+{
+	(void)ctx;
+	if (!g_padapter || !g_coex_tdma_active)
+		return;
+	if (g_coex_tdma_phase == 0) {
+		/* Bluetooth slot: g_coex_tdma_bt_ms of antenna grant */
+		rtw_write32(g_padapter, 0x38, 0x0000ff00);
+		g_coex_tdma_phase = 1;
+		rtl_mod_timer_rel(&g_coex_tdma_timer, g_coex_tdma_bt_ms);
+	} else {
+		/* Wi-Fi slot: the rest of the cycle. Single-shot broadcast
+		 * frames (DHCP DISCOVER/ARP) only survive in this slot, so a
+		 * data-first ratio (55/10) keeps DHCP alive; 35/30 favors
+		 * BT audio. */
+		rtw_write32(g_padapter, 0x38, 0x00003300);
+		g_coex_tdma_phase = 0;
+		rtl_mod_timer_rel(&g_coex_tdma_timer, 65 - g_coex_tdma_bt_ms);
+	}
+}
+
+int rtl8814native_set_knob(uint32_t knob, uint32_t value){
 	if (!g_padapter)
 		return -1;
 	switch (knob) {
@@ -992,8 +1207,211 @@ int rtl8814native_set_knob(uint32_t knob, uint32_t value)
 	case 2:
 		rtl8814_wpa2_pmf_tx_enable(value != 0);
 		return 0;
+	case 3:
+		g_rtl_iolog = value;   /* console IOLog gate (debug aid) */
+		return 0;
+	case 6:
+		/* Fixed TX rate (MGN_* code, 0xFF = auto). Discriminates
+		 * "TX fails at high rates" vs "TX fails at all rates":
+		 * e.g. 0x6C = OFDM 54M, 0x02 = CCK 1M. Any manual value
+		 * clears the RSSI rate cap (user override). */
+		g_padapter->fix_rate = (u8)value;
+		g_rate_cap_active = 0;
+		rtl_printk("RTL8814Native: knob6 fix_rate=0x%02x (rate cap cleared)\n", (u8)value);
+		return 0;
+	case 7: {
+		/* Force IQK: bNeedIQK is never set in STA mode (only AP/IBSS/CAC
+		 * paths set HW_VAR_DO_IQK), so OFDM TX runs uncalibrated —
+		 * matches "CCK TX ok, OFDM TX dead". Setting bNeedIQK and
+		 * re-running set_channel_bwmode triggers rtw_phydm_iqk_trigger. */
+		HAL_DATA_TYPE *hal = GET_HAL_DATA(g_padapter);
+		hal->bNeedIQK = _TRUE;
+		set_channel_bwmode(g_padapter, hal->current_channel,
+				   hal->nCur40MhzPrimeSC, hal->current_channel_bw);
+		rtl_printk("RTL8814Native: knob7 IQK forced (bNeedIQK + channel re-set)\n");
+		return 0;
+	}
+	case 8: {
+		/* TX power chain diagnostic: re-run the whole power-level
+		 * application and log every stage (PG mode, loaded flags,
+		 * computed indexes, register readbacks for both RF paths). */
+		HAL_DATA_TYPE *hal = GET_HAL_DATA(g_padapter);
+		struct dm_struct *phydm = adapter_to_phydm(g_padapter);
+		u32 agc_a, agc_b;
+
+		rtl_printk("RTL8814Native: knob8 pg_mode=%d by_rate_loaded=%d limit_loaded=%d rf_set=%d rfe_expand=%d\n",
+			   hal->txpwr_pg_mode, hal->txpwr_by_rate_loaded,
+			   hal->txpwr_limit_loaded,
+			   query_phydm_default_rf_set_8821c(phydm),
+			   phydm->rfe_type_expand);
+		rtl_printk("RTL8814Native: knob8 computed idx: cck1m=0x%02x ofdm6m=0x%02x ofdm54m=0x%02x mcs7=0x%02x (path A, ch %d)\n",
+			   rtw_hal_get_tx_power_index(g_padapter, RF_PATH_A, CCK, MGN_1M,
+						      CHANNEL_WIDTH_20, BAND_ON_2_4G, hal->current_channel, 0, NULL),
+			   rtw_hal_get_tx_power_index(g_padapter, RF_PATH_A, OFDM, MGN_6M,
+						      CHANNEL_WIDTH_20, BAND_ON_2_4G, hal->current_channel, 0, NULL),
+			   rtw_hal_get_tx_power_index(g_padapter, RF_PATH_A, OFDM, MGN_54M,
+						      CHANNEL_WIDTH_20, BAND_ON_2_4G, hal->current_channel, 0, NULL),
+			   rtw_hal_get_tx_power_index(g_padapter, RF_PATH_A, HT_MCS0_MCS7, MGN_MCS7,
+						      CHANNEL_WIDTH_20, BAND_ON_2_4G, hal->current_channel, 0, NULL),
+			   hal->current_channel);
+		rtw_hal_set_tx_power_level(g_padapter, hal->current_channel);
+		agc_a = rtw_read32(g_padapter, 0x1d00);
+		agc_b = rtw_read32(g_padapter, 0x1d80);
+		rtl_printk("RTL8814Native: knob8 readback TXAGC pathA(0x1d00)=0x%08x pathB(0x1d80)=0x%08x\n",
+			   agc_a, agc_b);
+		return 0;
+	}
+	case 9: {
+		/* TXAGC true readback (0x1998 report mechanism — the 0x1d00
+		 * registers are write-only) + IQK fail flags. Decides whether
+		 * TX power is really applied and whether TX IQK ever ran. */
+		struct dm_struct *phydm = adapter_to_phydm(g_padapter);
+		struct dm_iqk_info *iqk = &phydm->IQK_info;
+		u8 r_cck, r_ofdm6, r_ofdm54, r_mcs7;
+
+		r_cck   = config_phydm_read_txagc_8821c(phydm, RF_PATH_A, 0);
+		r_ofdm6 = config_phydm_read_txagc_8821c(phydm, RF_PATH_A, 4);
+		r_ofdm54 = config_phydm_read_txagc_8821c(phydm, RF_PATH_A, 11);
+		r_mcs7  = config_phydm_read_txagc_8821c(phydm, RF_PATH_A, 19);
+		rtl_printk("RTL8814Native: knob9 TXAGC-read cck1m=0x%02x ofdm6m=0x%02x ofdm54m=0x%02x mcs7=0x%02x\n",
+			   r_cck, r_ofdm6, r_ofdm54, r_mcs7);
+		rtl_printk("RTL8814Native: knob9 IQK fail_report[0]=tx%d rx%d rxiqk_fail_code=%d bypass=%d n_fail=%d\n",
+			   iqk->iqk_fail_report[0][0][TX_IQK],
+			   iqk->iqk_fail_report[0][0][RX_IQK],
+			   iqk->rxiqk_fail_code[0][0],
+			   iqk->bypass_iqk[0][0],
+			   phydm->n_iqk_fail_cnt);
+		rtl_printk("RTL8814Native: knob9 CCX data reports n=%u ok=%u retry=%u fail=%u last_rate=0x%02x last_retry=%u\n",
+			   g_ccx_rpt_cnt, g_ccx_rpt_ok, g_ccx_rpt_retry,
+			   g_ccx_rpt_fail, g_ccx_rpt_last_rate, g_ccx_rpt_last_retry);
+		return 0;
+	}
+	case 11:
+		/* CCX TX-report bits on unicast data frames (host-side rate
+		 * adaptation raw material, DrogaBox/rtw88 method). knob 9 then
+		 * shows the accumulated ok/retry/fail counters. */
+		g_ccx_data_rpt_enable = (value != 0);
+		rtl_printk("RTL8814Native: knob11 CCX data reports %s\n",
+			   value ? "ON (unicast data frames get SPE_RPT)" : "off");
+		return 0;
+	case 12:
+		/* RX parse strategy bitmask — runtime, no reboot to A/B:
+		 * bit0 (1) zero-desc filler skip (chip page padding),
+		 * bit1 (2) 8-byte resync scan after a lost walk,
+		 * bit2 (4) straddle carry (reassembly).
+		 * 0 = stock vendor parse (abort on first bad desc). */
+		g_rx_parse_knob = value & 0x7;
+		g_rx_reassemble = (value & 4) ? 1 : 0;
+		rtl_printk("RTL8814Native: knob12 rx parse 0x%x (skip=%d resync=%d carry=%d)\n",
+			   g_rx_parse_knob, value & 1, (value >> 1) & 1, (value >> 2) & 1);
+		return 0;
+	case 10: {
+		/* Coexistence modes (single-antenna combo dongle, BT active).
+		 * Register choreography proven by Zerotix99/RTL8821CU-macOS-Coexistence:
+		 *   0xcb4 = PTA/antenna-switch control (0x10000077 = wifi-only lock,
+		 *           0x10000066 = hardware PTA arbitration)
+		 *   0x38  = front-end grant (0x3300 = Wi-Fi, 0xff00 = Bluetooth)
+		 * value 0: wifi-only lock (current default)
+		 * value 1: hardware PTA (chip arbitrates per-packet)
+		 * value 2: static 100% Wi-Fi grant (BT starved — debug only)
+		 * value 3: TDMA 35ms Wi-Fi / 30ms BT (simultaneous BT audio) */
+		if (!g_coex_tdma_inited) {
+			setup_timer(&g_coex_tdma_timer, rtl8814_coex_tdma_tick, 0);
+			g_coex_tdma_inited = 1;
+		}
+		del_timer(&g_coex_tdma_timer);
+		g_coex_tdma_active = 0;
+
+		switch (value) {
+		case 0:
+			rtw_write32(g_padapter, 0xcb4, 0x10000077);
+			rtl_printk("RTL8814Native: knob10 coex=wifi-only lock (0xcb4=0x10000077)\n");
+			break;
+		case 1:
+			rtw_write32(g_padapter, 0xcb4, 0x10000066);
+			rtl_printk("RTL8814Native: knob10 coex=hardware PTA (0xcb4=0x10000066)\n");
+			break;
+		case 2:
+			rtw_write32(g_padapter, 0x38, 0x00003300);
+			rtl_printk("RTL8814Native: knob10 coex=static Wi-Fi grant (0x38=0x3300)\n");
+			break;
+		case 3:
+			/* TDMA 35ms WL / 30ms BT — BT-audio-first cycle */
+			g_coex_tdma_bt_ms = 30;
+			rtw_write32(g_padapter, 0xcb4, 0x10000066);
+			g_coex_tdma_phase = 0;
+			g_coex_tdma_active = 1;
+			rtl_mod_timer_rel(&g_coex_tdma_timer, 1);
+			rtl_printk("RTL8814Native: knob10 coex=TDMA 35ms WL / 30ms BT started\n");
+			break;
+		case 4:
+			/* Data-first TDMA 55ms WL / 10ms BT (DEFAULT): single-shot
+			 * broadcasts survive the WL slot (~85% per attempt),
+			 * BT keeps paging/idle time. knob 10 3 for BT audio. */
+			g_coex_tdma_bt_ms = 10;
+			rtw_write32(g_padapter, 0xcb4, 0x10000066);
+			g_coex_tdma_phase = 0;
+			g_coex_tdma_active = 1;
+			rtl_mod_timer_rel(&g_coex_tdma_timer, 1);
+			rtl_printk("RTL8814Native: knob10 coex=TDMA 55ms WL / 10ms BT (data-first)\n");
+			break;
+		default:
+			return -1;
+		}
+		return 0;
+	}
+	case 4: {
+		/* RX A-MPDU aggregation off/on. On a lossy RF link the reorder
+		 * buffer adds head-of-line latency (stuck windows wait for lost
+		 * frames). value=1: reject future ADDBA (fix_rx_ampdu_accept=0)
+		 * AND send DELBA to tear down live RX BA sessions now. value=0:
+		 * back to auto-accept. */
+		struct sta_info *ap_sta;
+		if (value) {
+			g_padapter->fix_rx_ampdu_accept = 0;
+			if (get_fwstate(&g_padapter->mlmepriv) & _FW_LINKED) {
+				ap_sta = rtw_get_stainfo(&g_padapter->stapriv,
+							 get_bssid(&g_padapter->mlmepriv));
+				if (ap_sta) {
+					send_delba(g_padapter, 0, ap_sta->cmn.mac_addr);
+					rtl_printk("RTL8814Native: knob4 RX A-MPDU disabled, DELBA sent to AP\n");
+				}
+			} else {
+				rtl_printk("RTL8814Native: knob4 RX A-MPDU disabled (not linked, DELBA skipped)\n");
+			}
+		} else {
+			g_padapter->fix_rx_ampdu_accept = RX_AMPDU_ACCEPT_INVALID;
+			rtl_printk("RTL8814Native: knob4 RX A-MPDU re-enabled (auto-accept)\n");
+		}
+		return 0;
+	}
+	case 5: {
+		/* TX A-MPDU aggregation off/on. If aggregated TX frames are
+		 * assembled wrong (DMA/desc), unicast data fails while
+		 * management/broadcast (never aggregated) works — matches the
+		 * observed loss profile. value=1: clear ampdu_enable and send
+		 * a TX-direction DELBA. value=0: re-enable. */
+		struct sta_info *ap_sta;
+		if (value) {
+			g_padapter->mlmepriv.htpriv.ampdu_enable = _FALSE;
+			if (get_fwstate(&g_padapter->mlmepriv) & _FW_LINKED) {
+				ap_sta = rtw_get_stainfo(&g_padapter->stapriv,
+							 get_bssid(&g_padapter->mlmepriv));
+				if (ap_sta) {
+					send_delba(g_padapter, 1, ap_sta->cmn.mac_addr);
+					rtl_printk("RTL8814Native: knob5 TX A-MPDU disabled, DELBA sent to AP\n");
+				}
+			} else {
+				rtl_printk("RTL8814Native: knob5 TX A-MPDU disabled (not linked, DELBA skipped)\n");
+			}
+		} else {
+			g_padapter->mlmepriv.htpriv.ampdu_enable = _TRUE;
+			rtl_printk("RTL8814Native: knob5 TX A-MPDU re-enabled\n");
+		}
+		return 0;
 	}
 	return -1;
+}
 }
 
 int rtl8814native_disconnect(void)
@@ -1089,7 +1507,7 @@ int rtl8814native_radio_channels(struct rtl_radio_chan *out, uint32_t *count)
 			continue;
 		out[n].channel = ch->ChannelNum;
 		out[n].band = ch->ChannelNum > 14 ? RTL_RADIO_BAND_5G : RTL_RADIO_BAND_2G;
-		out[n].passive = (ch->ScanType == SCAN_PASSIVE) ? 1 : 0;
+		out[n].passive = (ch->flags & RTW_CHF_NO_IR) ? 1 : 0;
 		out[n].reserved = 0;
 		n++;
 	}
@@ -1139,7 +1557,7 @@ int rtl8814native_radio_join(struct rtl_radio_join *j)
 				rtl8814native_jlog(JL_FLUSH_SCANQ, rtw_get_passing_time_ms(g_last_leave_ms), 0);
 				g_join_flush_scanq = 1;
 			}
-			rc = rtw_set_802_11_connect(g_padapter, (u8 *)j->bssid, &ndis_ssid) == _TRUE ? 0 : -EIO;
+			rc = rtw_set_802_11_connect(g_padapter, (u8 *)j->bssid, &ndis_ssid, 0) == _TRUE ? 0 : -EIO;
 			/* The passphrase is not kept, so a wake re-join must not run open */
 			g_last_ssid[0] = '\0';
 			if (rc)
@@ -1188,7 +1606,7 @@ int rtl8814native_radio_join(struct rtl_radio_join *j)
 			rtl8814native_jlog(JL_FLUSH_SCANQ, rtw_get_passing_time_ms(g_last_leave_ms), 0);
 			g_join_flush_scanq = 1;
 		}
-		rc = rtw_set_802_11_connect(g_padapter, (u8 *)j->bssid, &ndis_ssid) == _TRUE ? 0 : -EIO;
+		rc = rtw_set_802_11_connect(g_padapter, (u8 *)j->bssid, &ndis_ssid, 0) == _TRUE ? 0 : -EIO;
 		if (rc == 0) {
 			/* Remembered for the automatic re-join at wake */
 			_rtw_memcpy(g_last_ssid, ssid, j->ssid_len + 1);
@@ -1467,9 +1885,9 @@ void rtl8814native_get_link_status(struct rtl8814_link_status *out)
 		out->reg_rcr = rtw_read32(g_padapter, REG_RCR);
 		out->reg_rxfltmap0 = rtw_read16(g_padapter, REG_RXFLTMAP0);
 		out->reg_rxfltmap2 = rtw_read16(g_padapter, REG_RXFLTMAP2);
-		out->rate.reg_trxdma_ctrl = rtw_read16(g_padapter, REG_TRXDMA_CTRL_8814A);
-		out->rate.reg_rxdma_agg_pg_th = rtw_read32(g_padapter, REG_RXDMA_AGG_PG_TH_8814A);
-		out->rate.reg_rxdma_mode = rtw_read32(g_padapter, REG_RXDMA_MODE_8814A);
+		out->rate.reg_trxdma_ctrl = rtw_read16(g_padapter, REG_TXDMA_PQ_MAP);
+		out->rate.reg_rxdma_agg_pg_th = rtw_read32(g_padapter, REG_RXDMA_AGG_PG_TH);
+		out->rate.reg_rxdma_mode = rtw_read32(g_padapter, REG_RXDMA_MODE_8821C);
 	}
 	rtl8814_fill_rate_diag(&out->rate);
 

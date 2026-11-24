@@ -295,11 +295,46 @@ void rtl_mdelay(unsigned long msecs)
 /* ======================================================================
  * Logging
  * ====================================================================== */
+static struct rtl_bootlog_entry g_bootlog[RTL_BOOTLOG_N];
+static volatile SInt64 g_bootlog_next = 0;
+
+void rtl_bootlog_capture(const char *s)
+{
+	SInt64 i = OSAddAtomic64(1, &g_bootlog_next) - 1;
+	struct rtl_bootlog_entry *e = &g_bootlog[i & (RTL_BOOTLOG_N - 1)];
+	size_t len = strnlen(s, RTL_BOOTLOG_TEXT - 1);
+	uint64_t now;
+
+	clock_get_uptime(&now);
+	e->t_ns = now;
+	memcpy(e->text, s, len);
+	e->text[len] = '\0';
+	e->len = (uint32_t)len;
+	e->seq = (uint32_t)(i + 1);   /* commit marker, written last */
+}
+
+void rtl_bootlog_get(struct rtl_bootlog *out)
+{
+	if (!out)
+		return;
+	out->next = (uint64_t)OSAddAtomic64(0, &g_bootlog_next);
+	memcpy(out->e, g_bootlog, sizeof(out->e));
+	out->pad0 = 0;
+	out->pad1 = 0;
+}
+
+/* Console (IOLog) gate: verbose boot floods from vendor logging can stall
+ * the early-boot console, so IOLog is off by default — everything still
+ * lands in the bootlog ring (rtl_bootlog_get), retrievable via test_uc. */
+volatile uint32_t g_rtl_iolog = 0;
+
 void rtl_vprintk(const char *fmt, va_list args)
 {
         char buf[256];
         vsnprintf(buf, sizeof(buf), fmt, args);
-        IOLog("RTL8814au: %s", buf);
+        rtl_bootlog_capture(buf);
+        if (g_rtl_iolog)
+                IOLog("RTL8814au: %s", buf);
 }
 
 void rtl_printk(const char *fmt, ...)
@@ -309,20 +344,25 @@ void rtl_printk(const char *fmt, ...)
         va_start(ap, fmt);
         vsnprintf(buf, sizeof(buf), fmt, ap);
         va_end(ap);
-        IOLog("RTL8814au: %s", buf);
+        rtl_bootlog_capture(buf);
+        if (g_rtl_iolog)
+                IOLog("RTL8814au: %s", buf);
 }
 
 void rtl_hexdump(const char *prefix, const void *buf, size_t len)
 {
         const u8 *p = buf;
-        size_t i;
-        IOLog("RTL8814au: %s (%zu bytes)\n", prefix, len);
-        for (i = 0; i < len && i < 128; i++) {
-                IOLog("%02x ", p[i]);
-                if ((i & 15) == 15) IOLog("\n");
-        }
-        if (len > 128) IOLog("... (%zu more)", len - 128);
-        IOLog("\n");
+        char line[240];
+        size_t i, n = 0;
+
+        if (len > 32)
+                len = 32;
+        n += (size_t)snprintf(line + n, sizeof(line) - n, "%s (%zu bytes):", prefix, len);
+        for (i = 0; i < len && n < sizeof(line) - 4; i++)
+                n += (size_t)snprintf(line + n, sizeof(line) - n, " %02x", p[i]);
+        rtl_bootlog_capture(line);
+        if (g_rtl_iolog)
+                IOLog("RTL8814au: %s\n", line);
 }
 
 /* ======================================================================
@@ -807,4 +847,87 @@ void rtl_kfree_skb(struct sk_buff *skb)
                 rtl_free(skb->head);
                 rtl_free(skb);
         }
+}
+
+/* ======================================================================
+ * sysptime (ktime_t equivalent, signed nanoseconds) — 8821cu vendor code
+ * ====================================================================== */
+#ifndef _SYSPTIME_T_
+#define _SYSPTIME_T_
+typedef s64 sysptime;
+#endif
+sysptime rtw_sptime_get(void)
+{
+	u64 ns;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return (sysptime)ns;
+}
+
+sysptime rtw_sptime_set(s64 secs, const u32 nsecs)
+{
+	return (sysptime)(secs * 1000000000LL + (s64)nsecs);
+}
+
+sysptime rtw_sptime_zero(void)
+{
+	return 0;
+}
+
+int rtw_sptime_cmp(const sysptime cmp1, const sysptime cmp2)
+{
+	if (cmp1 < cmp2)
+		return -1;
+	if (cmp1 > cmp2)
+		return 1;
+	return 0;
+}
+
+bool rtw_sptime_eql(const sysptime cmp1, const sysptime cmp2)
+{
+	return rtw_sptime_cmp(cmp1, cmp2) == 0;
+}
+
+bool rtw_sptime_is_zero(const sysptime sptime)
+{
+	return rtw_sptime_cmp(sptime, rtw_sptime_zero()) == 0;
+}
+
+sysptime rtw_sptime_sub(const sysptime lhs, const sysptime rhs)
+{
+	return lhs - rhs;
+}
+
+sysptime rtw_sptime_add(const sysptime lhs, const sysptime rhs)
+{
+	return lhs + rhs;
+}
+
+s64 rtw_sptime_to_ms(const sysptime sptime)
+{
+	return sptime / 1000000LL;
+}
+
+sysptime rtw_ms_to_sptime(u64 ms)
+{
+	return (sysptime)(ms * 1000000ULL);
+}
+
+s64 rtw_sptime_to_us(const sysptime sptime)
+{
+	return sptime / 1000LL;
+}
+
+sysptime rtw_us_to_sptime(u64 us)
+{
+	return (sysptime)(us * 1000ULL);
+}
+
+s64 rtw_sptime_to_ns(const sysptime sptime)
+{
+	return sptime;
+}
+
+sysptime rtw_ns_to_sptime(u64 ns)
+{
+	return (sysptime)ns;
 }

@@ -13,6 +13,7 @@
 #include "RTLRadioABI.h"
 #include "RTLJoinLog.h"
 #include "RTLAwdlSim.h"
+#include <linux/printk.h>
 
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
@@ -214,6 +215,35 @@ IOReturn RTLUserClient::externalMethod(uint32_t selector,
                         return kIOReturnBadArgument;
                 rtl8814native_get_join_log((struct rtl_jlog *)args->structureOutput);
                 args->structureOutputSize = sizeof(struct rtl_jlog);
+                return kIOReturnSuccess;
+        }
+
+        case kRTLUC_GetBootLog: {
+                /* 53KB payload: may arrive as an OOL descriptor (IOConnectCallMethod)
+                 * or in-band (IOConnectCallStructMethod), like radioCall outputs. */
+                IOMemoryDescriptor *desc = args->structureOutputDescriptor;
+                uint32_t outCap = desc ? (uint32_t)args->structureOutputDescriptorSize
+                                       : args->structureOutputSize;
+                if (outCap < sizeof(struct rtl_bootlog))
+                        return kIOReturnBadArgument;
+                struct rtl_bootlog *log = (struct rtl_bootlog *)IOMalloc(sizeof(*log));
+                if (!log)
+                        return kIOReturnNoMemory;
+                bzero(log, sizeof(*log));
+                rtl8814native_get_bootlog(log);
+                if (desc) {
+                        if (desc->prepare() == kIOReturnSuccess) {
+                                desc->writeBytes(0, log, sizeof(*log));
+                                desc->complete();
+                        } else {
+                                IOFree(log, sizeof(*log));
+                                return kIOReturnError;
+                        }
+                } else {
+                        memcpy(args->structureOutput, log, sizeof(*log));
+                        args->structureOutputSize = sizeof(*log);
+                }
+                IOFree(log, sizeof(*log));
                 return kIOReturnSuccess;
         }
 

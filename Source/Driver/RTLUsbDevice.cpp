@@ -317,9 +317,15 @@ void rtlUrbCompletion(void *owner, void *parameter,
                 comp->parameter = nullptr;
 
         urb->actual_length = bytesTransferred;
+        if (status != kIOReturnSuccess)
+                IOLog("RTL8814Native: urb completion status 0x%08x, bytes=%u\n",
+                      status, bytesTransferred);
         switch (status) {
         case kIOReturnSuccess:
                 urb->status = 0;
+                break;
+        case kIOReturnTimeout:
+                urb->status = -ETIMEDOUT;
                 break;
         case kIOReturnAborted:
                 urb->status = -ECONNRESET;   /* vendor checks -ECONNRESET/-ENOENT */
@@ -380,7 +386,8 @@ int RTLUsbDevice::submitUrb(struct urb *urb)
         urb->done = 0;
         __sync_synchronize();
         urb->inflight = 1;
-        IOReturn err = pipe->io(mem, urb->transfer_buffer_length, comp, 0);
+        IOReturn err = pipe->io(mem, urb->transfer_buffer_length, comp,
+                                urb->timeout_ms);
         if (err != kIOReturnSuccess) {
                 urb->inflight = 0;
                 mem->complete(ioDir);

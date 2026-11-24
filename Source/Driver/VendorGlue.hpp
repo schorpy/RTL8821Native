@@ -112,6 +112,8 @@ struct rtl8814_rx_log {
 void rtl8814native_get_rx_log(struct rtl8814_rx_log *out);
 struct rtl_jlog;
 void rtl8814native_get_join_log(struct rtl_jlog *out);
+struct rtl_bootlog;
+void rtl8814native_get_bootlog(struct rtl_bootlog *out);
 
 /* Live driver options (rtl8814native_reg_access op 3, addr = option id) */
 enum {
