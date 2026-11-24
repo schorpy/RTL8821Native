@@ -18,16 +18,20 @@
 #include <hal_data.h>			/* HAL_DATA_TYPE */
 #include "../../hal_halmac.h"		/* RX desc */
 #include "../rtl8821c.h"		/* rtl8821c_query_rx_desc, rtl8821c_c2h_handler_no_io() */
+#include "../../../../Driver/VendorGlue.hpp"	/* RTL8821Native: g_trx_diag / g_rx_frames_decoded telemetry */
 
 /* RTL8821Native: RX straddle carry — the chip's USB burst packing lets
  * packets cross our 32KB transfer boundaries on this IC (RXBAD events:
  * payload parsed as descriptors). The stash/carry machinery lives in
  * Source/Compat/VendorOsDep8821.c. */
 extern volatile uint32_t g_rx_reassemble;
-extern volatile uint32_t g_rx_parse_knob;   /* knob 12: bit0 skip, bit1 resync, bit2 carry */
+extern volatile uint32_t g_rx_parse_knob;   /* knob 12: bit0 skip, bit1 resync, bit2 carry, bit3 skip-straddle */
+extern volatile uint32_t g_rx_skip_pending; /* knob 12 bit3: bytes to skip blind in the next transfer */
 int rtl8814native_rx_stage_prepend(const u8 **pbuf, s32 *transfer_len);
 void rtl8814native_rx_stash_tail_export(const u8 *pbuf, s32 left, u16 desc_pkt_len);
 void rtl8814native_rx_stage_reset(void);
+void rtl8814native_rx_stage_consume(void);
+extern volatile uint32_t g_rx_frames_decoded;	/* RTL8821Native: shared RX telemetry */
 
 int rtl8821cu_init_recv_priv(PADAPTER padapter)
 {
@@ -122,6 +126,31 @@ static u8 recvbuf2recvframe_proccess_normal_rx
 
 	recvframe_put(precvframe, pattrib->pkt_len);
 
+	/* RTL8821Native: wire the 8821C path into the shared telemetry.
+	 * g_rx_frames_decoded and the g_trx_diag rx_* counters were only
+	 * incremented in the 8814A parse path — on this IC the status
+	 * output showed rx_frames=0 / mgmt=0 / data=0 forever, which was
+	 * misread as "nothing delivered" (the 2026-11-24 rx_frames red
+	 * herring). Mirror the 8814 counters here. */
+	{
+		u8 *tdata = pbuf + pattrib->shift_sz + pattrib->drvinfo_sz + RXDESC_SIZE;
+		u8 fc0 = tdata[0];
+
+		g_rx_frames_decoded++;
+		g_trx_diag.rx_normal++;
+		switch ((fc0 >> 2) & 0x3) {
+		case 0:
+			g_trx_diag.rx_mgmt++;
+			if (fc0 == 0x80)
+				g_trx_diag.rx_beacon++;
+			else if (fc0 == 0x50)
+				g_trx_diag.rx_probe_rsp++;
+			break;
+		case 1: g_trx_diag.rx_ctrl++; break;
+		case 2: g_trx_diag.rx_data++; break;
+		}
+	}
+
 	pre_recv_entry(precvframe, pattrib->physt ? (pbuf + RXDESC_OFFSET) : NULL);
 
 exit:
@@ -157,6 +186,20 @@ int recvbuf2recvframe(PADAPTER padapter, void *ptr)
 	pbuf = pskb->data;
 #endif /* CONFIG_USE_USB_BUFFER_ALLOC_RX */
 
+	/* RTL8821Native (knob 12 bit3, skip-straddle): consume a pending
+	 * straddle remainder BEFORE anything else — these bytes are the
+	 * middle of a frame we already decided to drop, never a descriptor.
+	 * Zero-length URBs consume 0 and leave the skip intact. */
+	if (g_rx_skip_pending && transfer_len > 0) {
+		if ((u32)transfer_len <= g_rx_skip_pending) {
+			g_rx_skip_pending -= (u32)transfer_len;
+			return _SUCCESS;
+		}
+		pbuf += g_rx_skip_pending;
+		transfer_len -= (s32)g_rx_skip_pending;
+		g_rx_skip_pending = 0;
+	}
+
 	/* RTL8821Native: nothing parseable in this completion (zero-length
 	 * URB or a sub-descriptor tail). Return BEFORE prepending — a reparse
 	 * without the continuation fails at the first descriptor, and the
@@ -173,6 +216,11 @@ int recvbuf2recvframe(PADAPTER padapter, void *ptr)
 	    rtl8814native_rx_stage_prepend(&pbuf, &transfer_len))
 		bound_skb = NULL;
 
+
+	/* RTL8821Native: capture the first descriptor of this transfer for
+	 * the status dump ("Last RX Desc") — was 8814A-path-only before. */
+	if (transfer_len >= 24)
+		_rtw_memcpy(g_trx_diag.last_desc, pbuf, 24);
 
 #ifdef CONFIG_USB_RX_AGGREGATION
 	pkt_cnt = GET_RX_DESC_DMA_AGG_NUM_8821C(pbuf);
@@ -276,6 +324,38 @@ int recvbuf2recvframe(PADAPTER padapter, void *ptr)
 			desc_shift = pattrib->shift_sz;
 			desc_rpt = pattrib->pkt_rpt_type;
 			rtw_free_recvframe(precvframe, pfree_recv_queue);
+			{
+				/* RTL8821Native (knob 12 bit3, skip-straddle): a
+				 * sane head extending past this transfer is a
+				 * REAL straddle. The 2026-11-24 19:02 boot proved
+				 * the stash-completion path delivers CORRUPT
+				 * frames (element parse failed / icv_err) — so do
+				 * NOT re-parse/re-deliver: drop the frame and
+				 * blindly skip the remaining bytes of its RND8
+				 * extent (payload rest + pad) in the following
+				 * transfer(s). The walk lands exactly on the next
+				 * descriptor; the lost frame is recovered by
+				 * protocol retry (auth 300 ms, TCP, next beacon). */
+				u8 sane = desc_pkt_len > 0 && desc_pkt_len <= 12000 &&
+					  desc_drvinfo <= 120 &&
+					  desc_rpt <= C2H_PACKET;
+
+				if (sane && (g_rx_parse_knob & 8)) {
+					u32 extent = (u32)(RXDESC_SIZE + desc_drvinfo +
+							   desc_shift + desc_pkt_len);
+					u32 skip = _RND8(extent) - (u32)transfer_len;
+
+					if (skip && skip < 32000) {
+						static u32 skip_log_cnt;
+						g_rx_skip_pending = skip;
+						if ((skip_log_cnt++ & 0x3F) == 0)
+							rtl_printk("RTL8814Native: skip-straddle %u B pending (len=%u have=%d)\n",
+								   skip, desc_pkt_len,
+								   transfer_len);
+						goto _exit_recvbuf2recvframe;
+					}
+				}
+			}
 			/* RTL8821Native: straddle carry + resync.
 			 * - Sane head descriptor that merely needs more bytes
 			 *   (pkt_offset beyond this transfer): a packet still
@@ -329,6 +409,7 @@ int recvbuf2recvframe(PADAPTER padapter, void *ptr)
 			 * it. phydm then parses padding as report content
 			 * (garbage macid -> page fault in ra_report_handler). */
 			c2h_pre_handler_rtl8821c(padapter, pbuf, RXDESC_SIZE + pattrib->pkt_len);
+			g_trx_diag.rx_c2h++;	/* RTL8821Native: 8821C path telemetry */
 			/* C2H_PACKET doesn't use recvframe, so free it */
 			rtw_free_recvframe(precvframe, pfree_recv_queue);
 			break;
@@ -363,6 +444,13 @@ int recvbuf2recvframe(PADAPTER padapter, void *ptr)
 	} while (transfer_len >= RXDESC_SIZE);
 
 _exit_recvbuf2recvframe:
+
+	/* RTL8821Native: this transfer delivered at least one frame — the
+	 * straddle chain is healthy, release the age/stuck-head trackers
+	 * (stage_consume was defined but never wired: the doom loop's age
+	 * cap was unreachable because stage_prepend resets the age). */
+	if (nparsed > 0)
+		rtl8814native_rx_stage_consume();
 
 	return _SUCCESS;
 }

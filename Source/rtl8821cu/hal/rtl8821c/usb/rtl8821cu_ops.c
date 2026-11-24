@@ -51,9 +51,14 @@ static u8 sethwreg(PADAPTER padapter, u8 variable, u8 *val)
 		 * burst packing exactly while scanning/idle — transfers ended
 		 * mid-packet, the RX parse lost the descriptor boundary, and
 		 * the wifi list went empty (AGG_PG_TH seen flipping
-		 * 0x00002005 -> 0x00000100 in the field). */
+		 * 0x00002005 -> 0x00000100 in the field).
+		 * RTL8821Native 2026-11-24 (17): size is a HARD LIMIT that
+		 * cuts the aggregate MID-FRAME (stall capture: 12 truncations/s
+		 * under load = RXBAD #5537->#5793 in 21 s). 16 KB cuts 3x
+		 * less often than 5 KB while staying well under the 32 KB
+		 * URB buffer and still bounded. knob 14 re-tunes at runtime. */
 		pHalData->rxagg_usb_timeout = 0x20;
-		pHalData->rxagg_usb_size = 0x05;
+		pHalData->rxagg_usb_size = 0x10;
 		rtw_halmac_rx_agg_switch(pdvobjpriv, _TRUE);
 #if 0
 		RTW_INFO("\n==========RAFFIC_STATISTIC==============\n");

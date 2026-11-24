@@ -208,15 +208,37 @@ volatile uint32_t g_rx_reassemble = 0;
 /* RTL8821Native: RX parse strategy bitmask, runtime-tunable via knob 12:
  * bit0 (1) zero-desc filler skip, bit1 (2) 8B resync scan, bit2 (4)
  * straddle carry. 0 = stock vendor parse. Default: everything on. */
-volatile uint32_t g_rx_parse_knob = 0x7;
+volatile uint32_t g_rx_parse_knob = 0x0;
+/* RTL8821Native 2026-11-24 A/B verdict (19:42 boot): every custom parse
+ * mode fails the join window —
+ *   bit2 carry: stash completions deliver CORRUPT frames (drift);
+ *   bit3 skip-straddle: a drift artifact parses "sane" and becomes a
+ *     blind skip of hundreds of bytes -> rx_frames 285/210 s, 0 beacons,
+ *     auth never completes. The sane-check is too weak to gate blind
+ *     skips; the resync scan must be the only drift recovery.
+ * STOCK vendor parse (0) is the only mode that joins AND holds under
+ * load (measured: 60-ping sweep 11.7% loss, connection stable; vendor
+ * aborts at straddles yet the stream empirically re-syncs). Default 0
+ * until a drift recovery is proven; all modes stay reachable via
+ * knob 12 for experiments. */
+volatile uint32_t g_rx_skip_pending = 0;
 static u8 g_rx_stage[RX_STAGE_SZ];
 static u32 g_rx_stage_len;
 static u32 g_rx_stage_age;
+/* RTL8821Native: stuck-head doom-breaker state — see
+ * rtl8814native_rx_stash_tail_export(). A same-length head re-exported
+ * without a single successful parse in between is the RX doom loop
+ * (measured 2026-11-24: carry==reassembled climbing in lockstep,
+ * rx_frames pinned at 0, DHCP never answers -> 169.254). */
+static u16 g_rx_exp_last_len;
+static u8  g_rx_exp_repeat;
 
 void rtl8814native_rx_stage_reset(void)
 {
 	g_rx_stage_len = 0;
 	g_rx_stage_age = 0;
+	g_rx_exp_last_len = 0;
+	g_rx_exp_repeat = 0;
 }
 
 static void rx_log_xfer(const u8 *buf, u32 len)
@@ -268,13 +290,16 @@ void rtl8814native_rx_stage_consume(void)
 {
 	g_rx_stage_len = 0;
 	g_rx_stage_age = 0;
+	/* A successful parse releases the stuck-head tracker: consecutive
+	 * same-length exports only count when NOTHING was delivered. */
+	g_rx_exp_last_len = 0;
+	g_rx_exp_repeat = 0;
 }
 
 /* Prepend the stashed tail to this transfer; returns 1 when the caller's
  * pbuf/transfer_len were replaced by the staged copy (pskb no longer
  * bounds the data — pass NULL as the bound skb downstream). */
-int rtl8814native_rx_stage_prepend(const u8 **pbuf, s32 *transfer_len)
-{
+int rtl8814native_rx_stage_prepend(const u8 **pbuf, s32 *transfer_len){
 	u32 slen = g_rx_stage_len;
 
 	if (!g_rx_reassemble || !slen ||
@@ -284,13 +309,41 @@ int rtl8814native_rx_stage_prepend(const u8 **pbuf, s32 *transfer_len)
 	*pbuf = g_rx_stage;
 	*transfer_len += (s32)slen;
 	g_rx_stage_len = 0;
-	g_rx_stage_age = 0;
+	/* RTL8821Native: DO NOT reset g_rx_stage_age here. The age must
+	 * count consecutive transfers without a successful parse: prepend
+	 * resetting it made RX_STAGE_MAX_AGE unreachable, so a stuck head
+	 * that re-parses with a DIFFERENT bogus length each cycle looped
+	 * forever (the same-length doom-breaker cannot see it). Age is
+	 * released by stage_consume() on any delivered frame, and by
+	 * stage_reset() / the export guard otherwise. */
 	g_trx_diag.rx_reassembled++;
 	return 1;
 }
 
 void rtl8814native_rx_stash_tail_export(const u8 *pbuf, s32 left, u16 desc_pkt_len)
 {
+	/* RTL8821Native: stuck-head doom-breaker. stage_prepend() resets
+	 * g_rx_stage_age (fresh-stash semantics), so RX_STAGE_MAX_AGE can
+	 * never expire for a head that re-fails identically every transfer:
+	 * prepend (age 0, reassembled++) -> walk dies at desc 0, head
+	 * "sane, waiting for payload" -> re-stash (carry++, age 1) -> loop
+	 * forever (carry==reassembled lockstep, rx_frames=0 — measured
+	 * 2026-11-24, SSID joined, WPA2 keys installed, no DHCP lease).
+	 * Same head length exported >=4 times with NO successful parse in
+	 * between = the stash window is misaligned — drop it entirely.
+	 * stage_consume() (called on any delivered frame) resets the count,
+	 * so healthy straddle chains and repeated same-size frames in
+	 * normal traffic are unaffected. */
+	if (desc_pkt_len && desc_pkt_len == g_rx_exp_last_len) {
+		if (++g_rx_exp_repeat >= 4) {
+			rtl8814native_rx_stage_reset();
+			g_trx_diag.rx_stage_dropped++;
+			return;
+		}
+	} else {
+		g_rx_exp_last_len = desc_pkt_len;
+		g_rx_exp_repeat = 0;
+	}
 	rx_stash_tail(pbuf, left, desc_pkt_len);
 }
 

@@ -38,6 +38,11 @@ extern volatile uint32_t g_rx_urb_submit_err;
 extern u8 rtl8814native_awdl_backop;
 extern volatile uint32_t g_rx_reassemble;
 extern volatile uint32_t g_rx_parse_knob;
+/* RTL8821Native: knob 13 — suppress scans while _FW_LINKED. A scan
+ * triggered while associated wedges the radio off-channel (measured
+ * 2026-11-24: 11.8 s until rtw_scan_timeout_handler; mgmt TX all
+ * no-ACK; beacon watchdog disconnects). Default ON. */
+volatile uint32_t g_scan_block_linked = 1;
 extern volatile uint32_t g_rx_skb_recycle;
 static uint32_t g_bulk_in_mps;
 static uint32_t g_usb_switch;   /* RTL_USB_SWITCH_*; survives re-probe, reset on kext load */
@@ -670,8 +675,23 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 		 * RXBAD events captured with payload parsed as descriptors
 		 * after packets straddled the 32KB transfer boundaries).
 		 * Stash the tail, rejoin it to the next transfer's head. */
-		g_rx_reassemble = 1;
-		rtl_printk("RTL8814Native: RX reassembly ON (straddle carry)\n");
+		/* RTL8821Native 2026-11-24 (sweep 20:24, -54 dBm): RX parse =
+		 * knob 12 = 3 (zero-desc skip + resync, NO carry) measured
+		 * 1.7% loss — best mode; carry remains proven harmful. This
+		 * also makes the reassemble flag consistent at boot (stock-
+		 * splice joins needed a manual `knob 12 0` before). */
+		rtl8814native_set_knob(12, 3);
+		rtl_printk("RTL8814Native: RX parse = knob12=3 (zero-skip+resync, carry off)\n");
+
+		/* RTL8821Native 2026-11-24: TX rate = OFDM 24M forced
+		 * (knob 6 48) at bring-up. Sweep verdict: blind FW RA auto =
+		 * 20-25% loss (it walks into 36M+ = 100% loss even at -54 dBm);
+		 * forced 24M = 3.3%. The rate cap watchdog cannot protect
+		 * auto mode (its release threshold -55 dBm sits right where
+		 * the wall starts). Throughput cost accepted until the FW-RA
+		 * feedback chain works; knob 6 255 restores auto at runtime. */
+		rtl8814native_set_knob(6, 48);
+		rtl_printk("RTL8814Native: TX rate = 24M forced (knob6=48)\n");
 
 		/* Coexistence default = data-first TDMA (knob 10 mode 4, 55 ms
 		 * Wi-Fi / 10 ms BT): measured 0% ping loss and fast browsing;
@@ -948,6 +968,18 @@ int rtl8814native_trigger_scan(const uint32_t *channels, uint32_t count)
 		}
 	}
 
+	/* RTL8821Native (knob 13): refuse scans while associated — the
+	 * backop path wedges the radio off-channel (see g_scan_block_linked).
+	 * Returning 0 keeps the caller happy; the scanned list stays stale
+	 * until the next disconnected scan. */
+	if (g_scan_block_linked &&
+	    (get_fwstate(&g_padapter->mlmepriv) & _FW_LINKED)) {
+		rtl_printk("RTL8814Native: scan request suppressed while linked (knob13)\n");
+		if (parm)
+			rtw_mfree((u8 *)parm, sizeof(*parm));
+		return 0;
+	}
+
 	/* Note: rtw_set_802_11_bssid_list_scan acquires &mlmepriv.lock internally */
 	res = rtw_set_802_11_bssid_list_scan(g_padapter, parm);
 
@@ -1119,6 +1151,10 @@ void rtl8814native_note_ccx_report(u8 rate, u8 retry, u8 state)
  * When CCX data reports are enabled (knob 11), the counters below feed a
  * future host-side ladder (DrogaBox/rtw88 method). */
 static volatile int g_rate_cap_active;
+/* RTL8821Native: remembered knob-6 value (boot default 48 = OFDM 24M).
+ * Association clobbers fix_rate back to auto; the watchdog re-applies
+ * this so the rate-wall protection survives reassociation. */
+static volatile u8 g_fix_rate_default = 48;
 
 void rtl8814native_rate_cap_tick(void)
 {
@@ -1163,6 +1199,16 @@ void rtl8814native_rate_cap_tick(void)
 			stable = 0;
 		}
 		return;
+	}
+
+	if (!g_rate_cap_active && a->fix_rate != (u8)g_fix_rate_default) {
+		/* RTL8821Native: fix_rate auto-heal — association resets it
+		 * to auto (the 20:37 sweep's 28% baseline); re-apply the
+		 * remembered knob-6 default. Skipped while the RSSI cap or
+		 * the CCX ladder owns fix_rate. */
+		a->fix_rate = (u8)g_fix_rate_default;
+		rtl_printk("RTL8814Native: watchdog re-applied fix_rate=0x%02x\n",
+			   (u8)g_fix_rate_default);
 	}
 
 	if (!g_rate_cap_active && a->fix_rate == 0xFF && rssi <= -60) {
@@ -1214,8 +1260,14 @@ int rtl8814native_set_knob(uint32_t knob, uint32_t value){
 		/* Fixed TX rate (MGN_* code, 0xFF = auto). Discriminates
 		 * "TX fails at high rates" vs "TX fails at all rates":
 		 * e.g. 0x6C = OFDM 54M, 0x02 = CCK 1M. Any manual value
-		 * clears the RSSI rate cap (user override). */
+		 * clears the RSSI rate cap (user override).
+		 * RTL8821Native 2026-11-24: association CLOBBERS fix_rate
+		 * back to auto (measured: boot default 48 lost after join ->
+		 * baseline 28% loss; the explicit knob6=48 stage measured
+		 * 13.3%). The value is remembered and the watchdog re-applies
+		 * it, so the boot default survives association. */
 		g_padapter->fix_rate = (u8)value;
+		g_fix_rate_default = (u8)value;
 		g_rate_cap_active = 0;
 		rtl_printk("RTL8814Native: knob6 fix_rate=0x%02x (rate cap cleared)\n", (u8)value);
 		return 0;
@@ -1298,13 +1350,58 @@ int rtl8814native_set_knob(uint32_t knob, uint32_t value){
 		/* RX parse strategy bitmask — runtime, no reboot to A/B:
 		 * bit0 (1) zero-desc filler skip (chip page padding),
 		 * bit1 (2) 8-byte resync scan after a lost walk,
-		 * bit2 (4) straddle carry (reassembly).
+		 * bit2 (4) straddle carry (reassembly stash),
+		 * bit3 (8) skip-straddle: drop the straddled frame and
+		 *          blind-skip its RND8 remainder (default ON — the
+		 *          2026-11-24 19:02 boot proved stash completions
+		 *          deliver corrupt frames; skip keeps the walk in
+		 *          sync and lets protocol retry recover).
 		 * 0 = stock vendor parse (abort on first bad desc). */
-		g_rx_parse_knob = value & 0x7;
+		g_rx_parse_knob = value & 0xF;
 		g_rx_reassemble = (value & 4) ? 1 : 0;
-		rtl_printk("RTL8814Native: knob12 rx parse 0x%x (skip=%d resync=%d carry=%d)\n",
-			   g_rx_parse_knob, value & 1, (value >> 1) & 1, (value >> 2) & 1);
+		rtl_printk("RTL8814Native: knob12 rx parse 0x%x (skip=%d resync=%d carry=%d skip-straddle=%d)\n",
+			   g_rx_parse_knob, value & 1, (value >> 1) & 1,
+			   (value >> 2) & 1, (value >> 3) & 1);
 		return 0;
+	case 13:
+		/* Scan suppression while associated (runtime A/B, default ON).
+		 * Measured 2026-11-24 18:48: a scan triggered ~200 ms after
+		 * join wedged the radio off-channel for 11.8 s (no home-
+		 * channel return) until rtw_scan_timeout_handler fired; every
+		 * mgmt TX ACK-wait timed out and the beacon watchdog
+		 * disconnected. Idle scans are unaffected (only run when NOT
+		 * _FW_LINKED). knob 13 0 restores scan-while-linked (backop
+		 * experiment). */
+		g_scan_block_linked = (value != 0);
+		rtl_printk("RTL8814Native: knob13 scan-while-linked %s\n",
+			   g_scan_block_linked ? "SUPPRESSED (default)" : "allowed");
+		return 0;
+	case 14: {
+		/* RX aggregate HARD LIMIT (KB, HALMAC size threshold).
+		 * 2026-11-24 stall capture: the chip cuts the RX aggregate
+		 * MID-FRAME at the size limit — 12 truncations/s under load
+		 * (RXBAD #5537->#5793 in 21 s), each costing a frame + TCP
+		 * retransmit; that is the 65 KB/s-vs-800 KB/s throughput
+		 * killer. Association forces size=5 (5 KB). knob 14 sets a
+		 * bigger hard limit at runtime (8/16/24, max useful < 32 KB
+		 * URB buffer) and re-applies the agg config. 0 = halmac
+		 * default. Timeout untouched (knob 15). */
+		HAL_DATA_TYPE *hal = GET_HAL_DATA(g_padapter);
+		hal->rxagg_usb_size = (u8)value;
+		rtw_halmac_rx_agg_switch(adapter_to_dvobj(g_padapter), _TRUE);
+		rtl_printk("RTL8814Native: knob14 rxagg size=%d KB (AGG_PG_TH=0x%08x)\n",
+			   value, rtw_read32(g_padapter, 0x0280));
+		return 0;
+	}
+	case 15: {
+		/* RX aggregate timeout (HALMAC units, assoc default 0x20). */
+		HAL_DATA_TYPE *hal = GET_HAL_DATA(g_padapter);
+		hal->rxagg_usb_timeout = (u8)value;
+		rtw_halmac_rx_agg_switch(adapter_to_dvobj(g_padapter), _TRUE);
+		rtl_printk("RTL8814Native: knob15 rxagg timeout=0x%x (AGG_PG_TH=0x%08x)\n",
+			   value, rtw_read32(g_padapter, 0x0280));
+		return 0;
+	}
 	case 10: {
 		/* Coexistence modes (single-antenna combo dongle, BT active).
 		 * Register choreography proven by Zerotix99/RTL8821CU-macOS-Coexistence:
