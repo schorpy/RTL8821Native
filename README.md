@@ -1,264 +1,101 @@
-# RTL8814Native
+# RTL8821Native
 
-A native macOS driver for Realtek RTL8814AU (4x4 802.11ac) USB Wi-Fi adapters, with AWDL implemented in software so that AirDrop can run on a radio Apple never shipped.
+A port of [DrogaBox's RTL8814Native](https://github.com/DrogaBox/RTL8814Native) to the **Realtek RTL8821CU** (`0bda:c820`, 1x1 802.11ac/bgn USB dongle): a native macOS driver that shows up in the **normal Wi-Fi menu**, built as two kexts loaded through OpenCore.
 
-I wrote it because the only options on macOS were closed-source Realtek utilities, and I wanted the adapter to show up in the normal Wi-Fi menu like any other card. Once that worked, I kept going into AWDL.
+- `RTL8821Native.kext` — the radio driver: USB transport, the Realtek HAL/PHY code (`Source/rtl8821cu/`, vendored from the Linux vendor driver) behind a Linux-to-XNU compatibility layer, firmware loading, in-kernel WPA2-PSK supplicant, and the radio ABI (`RTLRadioABI.h`) that includes the AWDL ops.
+- `RTL8814AirLayer.kext` — publishes the radio to macOS as a native Skywalk/IO80211 interface so `airportd`, the menu bar and System Settings can scan, join and reconnect on their own.
 
-It is two kexts, loaded through OpenCore:
+Everything below is about the 8821CU port. For the original RTL8814AU project — including its working AirDrop implementation and the full reverse-engineering notes — see [README-UPSTREAM-8814AU.md](README-UPSTREAM-8814AU.md).
 
-- `RTL8814Native.kext` is the radio driver: USB transport, the Realtek HAL/PHY code (from `morrownr/8814au`) behind a small Linux-to-XNU compatibility layer, firmware loading, and an in-kernel WPA2-PSK and WPA3-SAE supplicant (4-way handshake, 802.11w).
-- `RTL8814AirLayer.kext` publishes the radio to macOS as a native Skywalk/IO80211 interface, so `airportd`, the menu bar and System Settings can scan, join and reconnect on their own. It also creates `awdl0` and runs AWDL on top of the same radio.
+## Where this port stands (2026-11-24)
 
-## Where this stands
+Tested on: iMac20,2 Hackintosh, macOS 26.7.3 (25G342), x86_64, RTL8821CU dongle (`0bda:c820`, interface 2). One machine, one adapter, one OS build — treat everything as untested elsewhere.
 
-Regular Wi-Fi works and I use it every day.
+### What works
 
-AirDrop works in the direction I was able to test: an iPhone sent a photo and a 64 MB video to this Mac. Sending from the Mac works against a software receiver I wrote for testing. Sending from the Mac to a real iPhone is implemented and has never been tested.
+- **Native Wi-Fi end to end**: scan, toggle, network list, typed-password WPA2-PSK join from macOS's own Wi-Fi menu, DHCP lease, default route, real HTTPS. No menu-bar helper app, no `networksetup` tricks.
+- **TX**: healthy at every rate (true TXAGC readback, clean IQK); 3691/3693 CCX reports OK at MCS7.
+- **DHCP**: reliable. Root-caused and fixed — the STA-mode BMC station never had an init rate, so every broadcast frame (DHCP DISCOVER, ARP) left at "invalid rate 0x0" and was silently lost.
+- **Bluetooth coexistence**: data-first TDMA (55 ms Wi-Fi / 10 ms BT) gives 0% ping loss with BT audio running on the same dongle. The firmware's own BT_COEXIST stack regresses the native UI and is OFF — do not re-enable it.
+- **RX**: bounded USB burst-packing aggregation + reassembly with straddle-carry. This chip lets packets straddle 32 KB USB transfer boundaries; the ported carry logic is the fix for that (upstream 8814AU never straddles, so it doesn't have it).
 
-That last part is the reason this repository is public again. I do not own an iPhone, an iPad or a Mac with Apple Wi-Fi. I had one borrowed iPhone for one evening, on November 8, 2026. Everything written after that day was measured against a simulator. I can keep writing code, but I cannot keep testing it blind, and I am not going to claim something works when I have not seen it work.
+### What does not work / help wanted
 
-If you have the adapter and any Apple device, twenty minutes of your time tells me more than another month of mine. The section [How you can help](#how-you-can-help) says exactly what I need.
+These are the open items, in priority order. Any of them is a good first issue.
 
-If you have neither and still want to see this finished, you can [help me get an iPhone](#help-me-get-an-iphone).
-
-A few things to know before you start:
-
-- **One preview build.** The [Releases](https://github.com/DrogaBox/RTL8814Native/releases) page has a single prebuilt pair of kexts, so that people who want to test do not have to set up a build first. It is exactly what runs on my machine and it has been tested nowhere else. Building from source is still the reference.
-- **No support.** I cannot debug installs on machines I cannot see. I read every report and I will answer when I can, but I make no promises about fixes or timing.
-- **One setup.** All of this was built and tested on a single machine. Details below.
-
-## What was tested, and how
-
-My setup: a TP-Link Archer T9UH v1 (`2357:0106`) on an AMD Hackintosh, macOS 26.7.3 (25G342), x86_64, with a CSR-based USB Bluetooth dongle. One WPA2/WPA3-transition router on 5 GHz and an Android hotspot that allows WPA3-SAE only. I have not tried any other adapter, board or access point. These are kernel extensions, so a bug can panic the machine. Keep a working copy of your EFI folder and use this at your own risk.
-
-### Wi-Fi
-
-- Scan, join, leave and reconnect from the Wi-Fi menu, on 2.4 and 5 GHz.
-- Open, WPA2-PSK and WPA3-SAE networks, with 802.11w (protected management frames). SAE, the 4-way handshake and PMF are done in the driver (`Source/Driver/SAE.c`, `WPA2Supplicant.c`, `PMF.c`), and a WPA2/WPA3 mixed router joins as WPA3. Known quirk: after a reboot without a clean leave, a PMF access point keeps the old association for 30 to 60 s and the first join attempt can fail; the next one works.
-- Sleep/wake and unplug/replug.
-- Location Services.
-- USB 3.0. The adapter enumerates as USB 2.0 and the driver switches it to USB 3.0 when it loads; on a motherboard port it then runs at SuperSpeed (5 Gbps).
-- Speed at SuperSpeed, on a 5 GHz 80 MHz link to my 2x2 router: 320 to 360 Mbit/s down and 130 to 330 Mbit/s up in October 2026, before AWDL existed. The Linux in-tree driver gives 288 to 366 down and 227 to 280 up with the same adapter, port and router, so the download side is on par. Measured again on November 13, 2026, with AWDL enabled and sharing the radio: 297 Mbit/s down and 266 Mbit/s up with macOS's own `networkQuality -I en2 -s`, and a 200 MB upload at 245 Mbit/s. At USB 2.0 High-Speed it was about 150 down and 83 up.
-
-### AWDL and AirDrop
-
-| What | State | How it was checked |
-|---|---|---|
-| `awdl0` exists and `wifip2pd` runs AWDL on it | Works | Daily use |
-| The iPhone sees the Mac in its AirDrop sheet | Works | Real iPhone, iOS 27, November 8 |
-| iPhone to Mac, a photo | Works | Real iPhone |
-| iPhone to Mac, a 64.3 MB video | Works: 80 s, about 800 KB/s | Real iPhone |
-| The Mac sees the iPhone in its AirDrop sheet | Failed that day. I found the cause and fixed it afterwards | Fix checked against the simulator only |
-| Mac to iPhone, any file | **Never tested** | Nothing |
-| Mac to the software receiver, a full file | Works | `Tools/awdlsim` |
-| TCP from the Mac over `awdl0` | About 19 MB/s with the radio parked at 80 MHz, about 15 MB/s while Wi-Fi stays associated | `Tools/awdlsim` |
-| Wi-Fi stays connected while AWDL runs | Works: one hour associated, link never dropped | `Tools/awdlsim` |
-| Block Ack and A-MPDU toward an Apple device | **Never tested.** The Mac requests it and aggregates on the air; whether an iPhone accepts is unknown | Simulator only |
-| Receive speed after the reordering work | **Never tested.** The 800 KB/s figure is from before it | Simulator only |
-| Sidecar, Universal Control, AirPlay over AWDL | **Never tested** | Nothing |
-| iPad, Apple Watch, Apple Silicon or Intel Macs as the other side | **Never tested** | Nothing |
-
-The simulator is a virtual AWDL peer (`Tools/awdlsim`) that talks to the driver through a test port, without going over the air. It is good at finding my own mistakes. It cannot tell me how a real Apple device reacts, and that is everything in the table marked as never tested.
-
-### What does not work
-
-- **WPA2/WPA3 Enterprise (802.1X, certificates).** There is no EAP code in the driver, and I have no network to test it on.
-- **WPA/TKIP-only and WEP.** The join code refuses anything but open or CCMP/WPA2-PSK.
-- **Following an access point's channel switch (CSA).** The driver parses the announcement and moves without leaving, but I could not make any of my access points announce one, so it is untested. Roaming between bands is implemented but I have not seen it fire.
-
-The `Info.plist` also lists USB IDs of other RTL8814AU adapters (ASUS USB-AC68, Alfa AWUS1900, Netgear A7000, Edimax EW-7833UAC, D-Link DWA-192, and others). Those come from the vendor driver and are untested.
-
-## How you can help
-
-There are three ways to test, depending on what you own, and one way to help if you own none of it. Reports go in a [new issue](https://github.com/DrogaBox/RTL8814Native/issues/new/choose).
-
-### 1. You have an RTL8814AU adapter and an Apple device
-
-This is the one I need most. An iPhone, an iPad or another Mac all count.
-
-You need:
-
-- An x86_64 Mac or Hackintosh on macOS 26.7.x. The layer checks the macOS build at boot; see [After a macOS update](#after-a-macos-update) if yours is not 25G342.
-- Working Bluetooth with Low Energy. AirDrop finds devices over Bluetooth before AWDL carries anything. On my CSR dongle that took one preference change, described in [Docs/en/AWDL_AIRDROP_BLE_CONTROLADOR.md](Docs/en/AWDL_AIRDROP_BLE_CONTROLADOR.md).
-- Both kexts built and installed with the AWDL boot-args from [Installing](#installing-opencore).
-- AirDrop set to Everyone on both sides.
-- `Tools/test_uc` built. The one-line command is under [Diagnostics](#diagnostics).
-
-Then:
-
-```bash
-Tools/awdl_report.sh check
-```
-
-It changes nothing and needs no root. It tells you whether the machine is ready and what is missing. When it passes:
-
-```bash
-sudo Tools/awdl_report.sh run
-```
-
-Leave it running and do these, in this order, with a file of 50 MB or more:
-
-1. Open the AirDrop sheet on the Apple device. Does this Mac appear?
-2. Send the file from the Apple device to the Mac. Does it arrive? How long does it take?
-3. Open the AirDrop sheet on the Mac (Finder, right-click a file, Share, AirDrop). Does the Apple device appear?
-4. Send the file from the Mac to the Apple device. Does it arrive? How long does it take?
-5. If you have time, repeat 2 and 4 with the Mac's Wi-Fi disconnected from any network.
-
-Press Ctrl-C when you are done. The tool asks a few questions and writes `awdl_report.txt`. Attach that file to the issue.
-
-About your privacy: the raw folder the tool collects holds device names and hardware addresses, and it stays on your machine. `awdl_report.txt` is built from it with addresses replaced by labels (`self-1`, `peer-1`) and names removed, and the tool refuses to write it if it still finds one. Read it before you post it anyway. It is plain text, and if you edit it by hand, `Tools/awdl_report.sh verify awdl_report.txt` repeats the check.
-
-A failed test is as useful as a passed one. If step 3 fails, that is exactly the report I am missing.
-
-### 2. You have Apple devices and no adapter
-
-You can still help, with a capture of what Apple devices say to each other. I need to see three things that I can only guess at from the kernel:
-
-- The Block Ack negotiation during an AirDrop: which side asks, with what parameters, and when relative to the first data frame.
-- Whether data frames sent to an iPhone on current iOS carry the 8-byte length header that iOS 27 puts on the ones it sends.
-- The rates and aggregate sizes two Apple devices settle on.
-
-This takes three devices, because the Mac that captures cannot take part in the transfer:
-
-1. On a Mac with Apple Wi-Fi, hold Option and click the Wi-Fi menu, choose Open Wireless Diagnostics, then Window, Sniffer. Pick channel 149 at 80 MHz. If nothing shows up, try 44, then 6.
-2. Start the capture, then AirDrop a file of 50 MB or more between the other two devices, right next to the Mac. Send it once in each direction.
-3. Stop the capture. macOS saves the file under `/var/tmp`.
-
-Do not attach the capture to a public issue. It contains the names and addresses of your devices and of every other device nearby on that channel. Open an issue saying you have one, with the device models and OS versions, and I will arrange a private way to receive it.
-
-### 3. You have a different adapter, board or macOS build
-
-Reports about plain Wi-Fi are welcome too: another RTL8814AU model, an Intel Mac, a different macOS build. Say what you ran it on, what worked, and attach the output of `Tools/test_uc status` and `Tools/test_uc joinlog`.
-
-### Help me get an iPhone
-
-Everything above depends on other people's time. Someone runs a test, I change something, and then I wait until they can run it again. With a phone on my desk that same loop takes minutes.
-
-I know what that is worth because I had it once. The evening with the borrowed iPhone showed me defects the simulator could never have shown, and they were fixed that same night, one build after another, with the phone still in the room. Receiving from an iPhone works today because of those few hours. Sending to one is still untested because the phone went home.
-
-I live in Argentina and I do this in my spare time, unpaid. An iPhone is out of my reach right now. It does not have to be new or in good shape. A used one that still runs current iOS is enough, because all it has to do is AirDrop.
-
-If this project is useful to you, or you just want AirDrop on hardware Apple does not sell, you can help pay for it:
-
-From anywhere in the world:
-
-- **GitHub Sponsors:** [github.com/sponsors/DrogaBox](https://github.com/sponsors/DrogaBox), or the Sponsor button at the top of this page
-- **PayPal:** `mrleisures@gmail.com`
-
-From a bank or wallet in Argentina (these two do not accept transfers from other countries):
-
-- **US dollars:** alias `drogabox.developer`
-- **Pesos:** alias `a.cristianabad`
-
-Any amount helps. When the phone is bought I will say so here.
-
-If you have an old iPhone in a drawer and would rather send that, open an issue and we will work it out.
-
-### Code
-
-Pull requests are welcome when they say how the change was tested. The reverse-engineering notes are in `Docs/`, in Spanish, with English copies under `Docs/en/`. [Docs/en/AWDL_INDICE.md](Docs/en/AWDL_INDICE.md) is the index and [Docs/en/GLOSSARY.md](Docs/en/GLOSSARY.md) explains the terms.
+1. **Join instability.** Auth succeeds every time, but the association response is lost ~5× before one attempt gets through (`report_join_res(-2,1)` sequences in the bootlog). Several RX-path fixes shipped for this (zero-desc filler skip, resync scan, runtime `knob 12` bitmask) — needs a clean retest.
+2. **Firmware rate-adaptation feedback is blind.** The FW adapts rates but never sends `C2H_RA_RPT` feedback to the driver (`handled=0`), so auto rate control parks at MCS7 and loses 20–60% at moderate distance. Interim mitigation: watchdog caps TX at OFDM 24M below −60 dBm. The real fix is the FW-RA feedback chain (H2C `RA_PARA` path re-check / FW RE). The 36M tier is untested; 54M measured 100% loss.
+3. **Ping loss 10–30% under BT audio at times.** Watch `RX Reassembly: reassembled=` and `RXBAD` lines to see whether the straddle-carry engages.
+4. **Hardware-MAC (Private Address OFF) joins** — rejected with a "wrong password" popup; a real `setMacAddress` is implemented and the SAE capability bit is cleared, retest pending.
+5. **AirDrop / AWDL** — the AWDL ops and the HW-ack port are ported to the 8821 HAL (`AWDLTx.c`), and upstream's AirDrop architecture is proven on 8814AU, but nothing is tested on this chip yet. That is the next chapter.
+6. **WPA3-SAE networks cannot join** — SAE is unimplemented on this port; WPA2/WPA3 transition networks join as WPA2.
+7. Cosmetic/unknown: RX descriptor corruption warnings on drift (pkt_len vs transfer_len), recurring `REG_TXDMA_STATUS 0x401` every 2 s.
 
 ## Building
 
-You need macOS with the Xcode Command Line Tools.
+macOS with the Xcode Command Line Tools:
 
-```bash
-./build.sh            # Build/RTL8814Native.kext
-./build_airlayer.sh   # Build/RTL8814AirLayer.kext
+```
+./build_rtl8821.sh    # -> Build/RTL8821Native.kext
+./build_airlayer.sh   # -> Build/RTL8814AirLayer.kext
 ```
 
-Do not compile anything under `Source/rtl8814au/os_dep/linux/`; the OS-specific parts live in `Source/Compat/` and `Source/Driver/`. After building the driver, check that no vendor symbols are left unresolved, because OpenCore silently drops a kext that has any:
+Verify **before deploying**: the build log must show `exit=0` **and** a `Built:` line — a failed build + chained deploy silently ships a stale binary. Then:
 
-```bash
-nm -u Build/RTL8814Native.kext/Contents/MacOS/RTL8814Native | grep -E "rtw|rtl|hal|dm_|odm|beam"
+```
+codesign --force --sign - Build/RTL8821Native.kext && codesign -vv Build/RTL8821Native.kext
+nm -u Build/RTL8821Native.kext/Contents/MacOS/RTL8814Native | grep -E "rtw|rtl|hal|dm_|odm"   # must print nothing
 ```
 
-That must print nothing.
+Do not compile anything under `Source/rtl8821cu/os_dep/linux/` as-is; the OS-specific parts live in `Source/Compat/` and `Source/Driver/` (`VendorProbe.c`, `VendorOsDep8821.c`).
 
 ## Installing (OpenCore)
 
-The kexts come from your own build (`Build/`) or from the preview zip on the Releases page; the steps are the same. The preview was validated on build 25G241 and I run it on 25G342, so on any build other than 25G241 it needs `rtlairtrust=<your build>` in the boot-args (see [After a macOS update](#after-a-macos-update)).
+1. Copy `Build/RTL8821Native.kext` and `Build/RTL8814AirLayer.kext` into `EFI/OC/Kexts/`, `dot_clean -m` each, `sync`.
+2. In `config.plist` under `Kernel -> Add`, enable both; the layer goes **after** the driver.
+3. Boot-args: `rtlair=2` for native Wi-Fi; add `rtlawdl=1` for the AWDL experiment.
+4. `rtlairtrust=<build>` — the layer checks the macOS build at boot and stays inert on an untrusted build. Validated for 25G342 (26.7.3); see upstream's [After a macOS update](README-UPSTREAM-8814AU.md#after-a-macos-update).
 
-1. Copy `Build/RTL8814Native.kext` and `Build/RTL8814AirLayer.kext` into `EFI/OC/Kexts/` on your internal EFI partition. Check which disk you are writing to: a USB stick can have the same volume name.
-2. Strip resource forks and sync:
-   ```bash
-   dot_clean -m EFI/OC/Kexts/RTL8814Native.kext
-   dot_clean -m EFI/OC/Kexts/RTL8814AirLayer.kext
-   sync
-   ```
-3. In `config.plist`, under `Kernel -> Add`, add both kexts with `Enabled` set, and put `RTL8814AirLayer.kext` after `RTL8814Native.kext`.
-4. Add the boot-args. For Wi-Fi only:
-   ```
-   rtlair=2
-   ```
-   For Wi-Fi and AWDL, the set I run with:
-   ```
-   rtlair=2 rtlawdl=1 rtlawdl_tx=1 rtlawdl_mcc=1 rtlawdl_sim=1 rtlawdl_air=15000 rtlawdl_lastaw=1
-   ```
-5. Reboot and plug the adapter into a USB 3 port on the motherboard. Avoid hubs: behind my monitor's USB 3 hub the switch to USB 3.0 fails, and the adapter drops off the bus until you replug it. Join your network from the Wi-Fi menu; macOS asks for the password the first time.
-
-What the boot-args do:
-
-| Boot-arg | Effect |
-|---|---|
-| `rtlair=2` | Loads the layer. Without it only the driver loads and you get a plain interface that you join from the command line (`Tools/test_uc`) |
-| `rtlawdl=1` | The layer creates `awdl0` |
-| `rtlawdl_tx=1` | AWDL is allowed to transmit. Without it the Mac only listens |
-| `rtlawdl_mcc=1` | AWDL shares the radio with the network you are connected to |
-| `rtlawdl_sim=1` | Opens the test port that `Tools/awdl_report.sh` and `Tools/awdlsim` use to read frames |
-| `rtlawdl_air=15000`, `rtlawdl_lastaw=1` | Transmit time per AWDL window. These are the values the throughput figures above were measured with |
-
-If something goes wrong, remove both kexts and the boot-args from the EFI.
-
-`Tools/phase5_deploy.sh` and `Tools/iphone_test.sh deploy` do these steps for me, including a backup of the EFI, but they are written for my setup.
-
-## After a macOS update
-
-`RTL8814AirLayer.kext` uses private IO80211 / Skywalk layouts of one macOS build, so it checks the running system at boot and stays inert on a build it was not validated on (the plain `RTL8814Native` interface keeps working). Run `Tools/airlayer_gate.py status` to see why it started or not. If the build is new but the structure matches, boot once with `rtlairtrust=<build>` (`Tools/airlayer_gate.py trust-arg` prints it), test the Wi-Fi menu, then `Tools/airlayer_gate.py learn --yes` and rebuild to make it permanent. Details in [Docs/PHASE5_IO80211.md](Docs/PHASE5_IO80211.md#version-gate-032).
-
-## How it fits together
-
-```
- airportd, wifip2pd, sharingd, Wi-Fi menu, System Settings
-              |  IO80211 / Skywalk
- RTL8814AirLayer.kext   native interface, scan, join, link quality,
-                        awdl0: election, sync, windows, data path
-              |  RTLRadioABI (internal)
- RTL8814Native.kext     compat layer, Realtek HAL/PHY, USB pipes,
-                        firmware loader, WPA2/WPA3 supplicant,
-                        AWDL frame transmit and channel hops
-```
-
-The adapter has one bulk IN, three bulk OUT and one interrupt endpoint. Receive runs several transfers in flight on its own worker thread; transmit is queued asynchronously with hardware aggregation. The chip has no AWDL support of its own: the election, the timing and the channel sequence all run in the layer, and the driver moves the radio between the network's channel and the AWDL channel.
+If anything goes wrong, disable both kexts and remove the `rtlair*` boot-args.
 
 ## Diagnostics
 
-`Tools/test_uc` talks to the driver through a user client:
-
-```bash
+```
 clang -Wall -O2 Tools/test_uc.c -framework IOKit -framework CoreFoundation -o Tools/test_uc
-./Tools/test_uc status      # link, RSSI, rates, counters
-./Tools/test_uc joinlog     # timeline of the last joins and leaves
-./Tools/test_uc peek 0x0290 # read a MAC register
+sudo Tools/test_uc status     # link, RSSI, rates, counters
+sudo Tools/test_uc joinlog    # join/leave timeline
+sudo Tools/test_uc bootlog    # kernel ring, 4096 entries
 ```
 
-`Tools/awdlsim` is the virtual AWDL peer (Rust 1.88 or later, `cd Tools/awdlsim && cargo build --release`). [Docs/en/AWDL_PAR_VIRTUAL.md](Docs/en/AWDL_PAR_VIRTUAL.md) explains what it covers and what it cannot.
+Runtime knobs (`sudo Tools/test_uc knob <n> <v>`), the ones specific to this port:
 
-## Docs
+| Knob | Effect |
+|---|---|
+| 4 / 5 | RX / TX A-MPDU off (+DELBA) |
+| 6 | force rate (`MGN_*` code, 255 = auto) |
+| 7 / 8 / 9 | force IQK / TX power snapshot / true TXAGC readback |
+| 10 | coex mode: 0 lock, 1 hw-PTA, 2 static grant, 3 TDMA 35/30, **4 TDMA 55/10 (default)** |
+| 11 | CCX data reports (rate-ladder raw material) |
+| 12 | RX parse strategy bitmask: 1 zero-desc skip, 2 resync scan, 4 carry; **7 = all on (default)** |
 
-- [Docs/ROADMAP.md](Docs/ROADMAP.md): what is done, what is open, and why
-- [Docs/ARCHITECTURE.md](Docs/ARCHITECTURE.md): hardware notes, USB rules, and a dated log of bugs and fixes
-- [Docs/PHASE5_IO80211.md](Docs/PHASE5_IO80211.md): notes on Apple's IO80211Family and Skywalk, including vtable layouts
-- [Docs/SAE_HANDOFF.md](Docs/SAE_HANDOFF.md): WPA3-SAE and 802.11w
-- [Docs/en/AWDL_INDICE.md](Docs/en/AWDL_INDICE.md): index of the AWDL notes
-- [Docs/en/AWDL_RESULTADO_IPHONE_1.md](Docs/en/AWDL_RESULTADO_IPHONE_1.md): the one test with a real iPhone, and what it broke
-- [Docs/en/AWDL_RENDIMIENTO_1.md](Docs/en/AWDL_RENDIMIENTO_1.md) and [AWDL_RENDIMIENTO_2.md](Docs/en/AWDL_RENDIMIENTO_2.md): throughput, Block Ack, sharing the radio with a connected network
-- [Docs/en/AWDL_PAR_VIRTUAL.md](Docs/en/AWDL_PAR_VIRTUAL.md): the simulator
+`Tools/test_diag.sh` (knob 9 + bootlog capture) and `Tools/test_online.sh` (join → DHCP → pings → HTTP → download in one run) automate the common sessions.
 
-The notes separate what was read in Apple's binaries, what was measured on hardware and what is still a guess. Where something was not verified, they say so.
+## Port notes — where this differs from upstream
+
+The interesting bugs were all 8821CU-specific; upstream's 8814AU code was the reference that proved what "correct" looks like:
+
+- **USB burst packing straddles 32 KB transfer boundaries** on this chip. RX reassembly with carry logic (ported into `Source/rtl8821cu/rtl8821cu_recv.c`) is mandatory; keep it ON at bring-up.
+- **`HW_VAR_RXDMA_AGG_PG_TH` must always use the bounded vendor values** (size=5 pages, timeout=0x20). The vendor low-traffic branch (size=0/timeout=1) re-enables unbounded burst packing exactly while idle/scanning — that was the "empty Wi-Fi list" root cause.
+- **C2H length**: `c2h_pre_handler_rtl8821c` must be called with the packet's own extent (`RXDESC_SIZE + pkt_len`), not the remaining transfer length — else phydm parses padding as content (page fault in the RA report handler).
+- **Channel plan init** (`rtw_rfctl_chplan_init`) was missing from `rtw_init_drv_sw` — "0 channels active", empty scans.
+- **Zero-length descriptors** are chip page padding between DMA agg bursts, sometimes with junk in the shift_sz bits. The parser skips them (adaptive advance, cap 32); rejecting them instead aborts the transfer and eats auth/assoc responses.
+- **BMC broadcast rate**: the STA-mode BMC station's `init_rate` was never set (only AP mode set it upstream-adjacent code) — broadcasts left at invalid rate 0x0. Fixed in `rtw_joinbss_update_stainfo` (lowest advertised rate, CCK 1M fallback) + broadcast duplication in the TX work queue.
+- **`CONFIG_BT_COEXIST` must NOT be defined** in `autoconf.h` — the define alone activates HAL-wide coex hooks that break the native Wi-Fi toggle.
+
+Full history of every bug and fix: `Docs/ARCHITECTURE.md` and upstream's `Docs/`.
 
 ## License and credit
 
-GPL-2.0, see [LICENSE](LICENSE). The Realtek code comes from `morrownr/8814au`. `Tools/awdlsim/vendor/crosswind-awdl` is MIT and keeps its own license file. The IOKit glue, the compatibility layer, the AirLayer and the AWDL implementation are Copyright (c) 2026 DrogaBox.
+GPL-2.0, see [LICENSE](LICENSE). This is a port of [DrogaBox/RTL8814Native](https://github.com/DrogaBox/RTL8814Native) — the architecture, the AirLayer, the radio ABI and the AWDL work are his (Copyright (c) 2026 DrogaBox); the original README is preserved at [README-UPSTREAM-8814AU.md](README-UPSTREAM-8814AU.md). The Realtek vendor code comes from the Linux `rtl8821cu` / `morrownr/8814au` sources.
 
-If you use any part of this, keep the copyright notices and credit the project. The license requires it, and it is the only thing I ask.
+If you use any part of this, keep the copyright notices and credit both projects. The license requires it, and it is the only thing they ask.
