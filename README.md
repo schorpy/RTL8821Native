@@ -13,23 +13,25 @@ Tested on: iMac20,2 Hackintosh, macOS 26.7.3 (25G342), x86_64, RTL8821CU dongle 
 
 ### What works
 
-- **Native Wi-Fi end to end**: scan, toggle, network list, typed-password WPA2-PSK join from macOS's own Wi-Fi menu, DHCP lease, default route, real HTTPS. No menu-bar helper app, no `networksetup` tricks.
-- **TX**: healthy at every rate (true TXAGC readback, clean IQK); 3691/3693 CCX reports OK at MCS7.
+- **Native Wi-Fi end to end**: scan, toggle, network list, typed-password WPA2-PSK join from macOS's own Wi-Fi menu, DHCP lease, default route, real HTTPS. No menu-bar helper app, no `networksetup` tricks. **Joins work at boot with no manual steps** (2026-11-24 session); a join may take 60–120 s because auth/assoc responses that land in a USB burst-boundary truncation window are recovered by the protocol's own retries.
+- **The connection holds**: scans are suppressed while associated (a periodic scan used to wedge the radio off-channel for 11.8 s until the beacon watchdog disconnected — the "connects for a few seconds then drops" cycle).
+- **TX**: healthy at every rate (true TXAGC readback, clean IQK). Ships with TX forced to OFDM 24M — the firmware's rate adapter is blind (see open items), and higher rates measured catastrophic: 36M is **100% loss even at −54 dBm**; auto wanders into it (20–25% loss). The watchdog re-applies the forced rate after every association.
 - **DHCP**: reliable. Root-caused and fixed — the STA-mode BMC station never had an init rate, so every broadcast frame (DHCP DISCOVER, ARP) left at "invalid rate 0x0" and was silently lost.
-- **Bluetooth coexistence**: data-first TDMA (55 ms Wi-Fi / 10 ms BT) gives 0% ping loss with BT audio running on the same dongle. The firmware's own BT_COEXIST stack regresses the native UI and is OFF — do not re-enable it.
-- **RX**: bounded USB burst-packing aggregation + reassembly with straddle-carry. This chip lets packets straddle 32 KB USB transfer boundaries; the ported carry logic is the fix for that (upstream 8814AU never straddles, so it doesn't have it).
+- **Bluetooth coexistence**: data-first TDMA (55 ms Wi-Fi / 10 ms BT). The firmware's own BT_COEXIST stack regresses the native UI and is OFF — do not re-enable it.
+- **RX parse** (`knob 12`): zero-desc filler skip + continuity-validated resync scan shipped as the boot default (measured 1.7% ping loss at −54 dBm vs 10–25% stock). Measured against mainline Linux `rtw88` (same chip): upstream has **no** straddle handling and loses the same frames we do — burst-boundary truncations never continue, so the plain vendor abort is the correct handling. The old reassembly-carry approach is superseded (it spliced truncation tails onto the next transfer's clean head and corrupted frames).
+- **RX USB aggregation**: bounded, with a 16 KB hard limit (association default was 5 KB — the chip cuts aggregates mid-frame at the limit, and at this port's throughput 5 KB measured ~12 truncated frames/second under load; 16 KB cuts 3× less often).
 
 ### What does not work / help wanted
 
 These are the open items, in priority order. Any of them is a good first issue.
 
-1. **Join instability.** Auth succeeds every time, but the association response is lost ~5× before one attempt gets through (`report_join_res(-2,1)` sequences in the bootlog). Several RX-path fixes shipped for this (zero-desc filler skip, resync scan, runtime `knob 12` bitmask) — needs a clean retest.
-2. **Firmware rate-adaptation feedback is blind.** The FW adapts rates but never sends `C2H_RA_RPT` feedback to the driver (`handled=0`), so auto rate control parks at MCS7 and loses 20–60% at moderate distance. Interim mitigation: watchdog caps TX at OFDM 24M below −60 dBm. The real fix is the FW-RA feedback chain (H2C `RA_PARA` path re-check / FW RE). The 36M tier is untested; 54M measured 100% loss.
-3. **Ping loss 10–30% under BT audio at times.** Watch `RX Reassembly: reassembled=` and `RXBAD` lines to see whether the straddle-carry engages.
+1. **Firmware rate-adaptation feedback is blind.** The FW adapts rates but never sends `C2H_RA_RPT` feedback to the driver (`handled=0`), so auto rate control parks in a measured dead zone (36M = 100% loss even at strong signal; 54M worse). This is why TX ships forced at 24M (~12 Mbps PHY — the main browsing-speed cost). The real fix is the FW-RA feedback chain (the CCX data-report counters are already wired, `knob 11`); that is how Tahoe-class speed returns.
+2. **Dynamic RX aggregation** (mainline-rtw88-style: agg OFF below 1 Mbps of traffic, ON above) would remove the truncation loss entirely at idle/browsing traffic. Blocked by one known issue: at `size=0` this port's RXDMA burst config lets packets straddle 32 KB URBs (compare `rtw_usb_init_burst_pkt_len`: `BIT_DMA_MODE | BURST_CNT=4 | BURST_SIZE_512`); fix that first, then port the toggle.
+3. **Intermittent high-loss windows** (run-to-run swing 2%→38% at similar RSSI) correlate with phone-side conditions (the hotspot shares its radio with BT audio; Tahoe control boots show the same stalls). `Tools/stall_capture.sh` exists to pin the remaining cases; one capture showed the "dead internet" window was actually alive (TCP 47 ms) with only DNS dying — mitigated outside the driver by fallback DNS resolvers.
 4. **Hardware-MAC (Private Address OFF) joins** — rejected with a "wrong password" popup; a real `setMacAddress` is implemented and the SAE capability bit is cleared, retest pending.
 5. **AirDrop / AWDL** — the AWDL ops and the HW-ack port are ported to the 8821 HAL (`AWDLTx.c`), and upstream's AirDrop architecture is proven on 8814AU, but nothing is tested on this chip yet. That is the next chapter.
 6. **WPA3-SAE networks cannot join** — SAE is unimplemented on this port; WPA2/WPA3 transition networks join as WPA2.
-7. Cosmetic/unknown: RX descriptor corruption warnings on drift (pkt_len vs transfer_len), recurring `REG_TXDMA_STATUS 0x401` every 2 s.
+7. Cosmetic/unknown: recurring `REG_TXDMA_STATUS 0x401` every 2 s; the status decoder shows HT rates as "VHT MCS…" labels.
 
 ## Building
 
@@ -72,20 +74,22 @@ Runtime knobs (`sudo Tools/test_uc knob <n> <v>`), the ones specific to this por
 | Knob | Effect |
 |---|---|
 | 4 / 5 | RX / TX A-MPDU off (+DELBA) |
-| 6 | force rate (`MGN_*` code, 255 = auto) |
+| 6 | force rate (`MGN_*` code, 255 = auto). **Boot default 48 = OFDM 24M**, re-applied by the watchdog after every association (auto walks into rates measured 100% loss even at strong signal) |
 | 7 / 8 / 9 | force IQK / TX power snapshot / true TXAGC readback |
 | 10 | coex mode: 0 lock, 1 hw-PTA, 2 static grant, 3 TDMA 35/30, **4 TDMA 55/10 (default)** |
 | 11 | CCX data reports (rate-ladder raw material) |
-| 12 | RX parse strategy bitmask: 1 zero-desc skip, 2 resync scan, 4 carry; **7 = all on (default)** |
+| 12 | RX parse strategy bitmask: 1 zero-desc filler skip, 2 resync scan, 4 reassembly-carry (harmful — splices truncation tails and corrupts frames), 8 skip-straddle (regressed joins). **Boot default 3 = zero-skip + resync** (measured 1.7% loss vs 10–25% stock) |
+| 13 | **1 (default)** suppress scan requests while associated — a post-join scan wedged the radio off-channel until the beacon watchdog disconnected |
+| 14 / 15 | RX-agg hard-limit size (KB; assoc default 16 — the chip cuts aggregates mid-frame at the limit) / timeout (0x20) |
 
-`Tools/test_diag.sh` (knob 9 + bootlog capture) and `Tools/test_online.sh` (join → DHCP → pings → HTTP → download in one run) automate the common sessions.
+`Tools/test_diag.sh` (knob 9 + bootlog capture) and `Tools/test_online.sh` (join → DHCP → pings → HTTP → download in one run) automate the common sessions. This port adds `Tools/loss_check.sh` (boot-state snapshot + knob sweeps with honest ping parsing), `Tools/join_diag.sh` (live join capture with the full bootlog persisted) and `Tools/stall_capture.sh` (during a dead window: direct-L2 vs through-NAT pings, ARP tcpdump, direct-IP TCP — separates link loss from DNS death).
 
 ## Port notes — where this differs from upstream
 
 The interesting bugs were all 8821CU-specific; upstream's 8814AU code was the reference that proved what "correct" looks like:
 
-- **USB burst packing straddles 32 KB transfer boundaries** on this chip. RX reassembly with carry logic (ported into `Source/rtl8821cu/rtl8821cu_recv.c`) is mandatory; keep it ON at bring-up.
-- **`HW_VAR_RXDMA_AGG_PG_TH` must always use the bounded vendor values** (size=5 pages, timeout=0x20). The vendor low-traffic branch (size=0/timeout=1) re-enables unbounded burst packing exactly while idle/scanning — that was the "empty Wi-Fi list" root cause.
+- **USB burst-boundary truncations**: the chip cuts its USB RX aggregate mid-frame at the size hard limit and the remainder never arrives — the next transfer starts at a frame boundary, so the correct handling is exactly the stock vendor abort (verified against mainline `rtw88`, which has no straddle handling and drops the same frames via the FCS check). Earlier lore said the carry/reassembly logic was the fix; three boots of evidence showed it instead spliced truncation tails onto the next transfer's clean head and corrupted frames. Zero-desc filler skip + continuity-validated resync scan (`knob 12` = 3) shipped instead. Do not re-enable bit 4.
+- **`HW_VAR_RXDMA_AGG_PG_TH` must always use bounded values**. The vendor low-traffic branch (size=0/timeout=1) re-enables unbounded burst packing exactly while idle/scanning — that was the "empty Wi-Fi list" root cause. The shipped hard limit is 16 KB (5 KB measured ~12 truncated frames/s under load); `knob 14` re-tunes at runtime. Mainline rtw88 uses 5 KB/0x20 and is fine at full speed — at this port's capped TX rate, bigger limits matter more.
 - **C2H length**: `c2h_pre_handler_rtl8821c` must be called with the packet's own extent (`RXDESC_SIZE + pkt_len`), not the remaining transfer length — else phydm parses padding as content (page fault in the RA report handler).
 - **Channel plan init** (`rtw_rfctl_chplan_init`) was missing from `rtw_init_drv_sw` — "0 channels active", empty scans.
 - **Zero-length descriptors** are chip page padding between DMA agg bursts, sometimes with junk in the shift_sz bits. The parser skips them (adaptive advance, cap 32); rejecting them instead aborts the transfer and eats auth/assoc responses.
