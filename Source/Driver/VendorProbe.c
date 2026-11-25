@@ -683,15 +683,17 @@ int rtl8814native_vendor_probe(struct usb_device *udev, unsigned long driver_inf
 		rtl8814native_set_knob(12, 3);
 		rtl_printk("RTL8814Native: RX parse = knob12=3 (zero-skip+resync, carry off)\n");
 
-		/* RTL8821Native 2026-11-24: TX rate = OFDM 24M forced
-		 * (knob 6 48) at bring-up. Sweep verdict: blind FW RA auto =
-		 * 20-25% loss (it walks into 36M+ = 100% loss even at -54 dBm);
-		 * forced 24M = 3.3%. The rate cap watchdog cannot protect
-		 * auto mode (its release threshold -55 dBm sits right where
-		 * the wall starts). Throughput cost accepted until the FW-RA
-		 * feedback chain works; knob 6 255 restores auto at runtime. */
-		rtl8814native_set_knob(6, 48);
-		rtl_printk("RTL8814Native: TX rate = 24M forced (knob6=48)\n");
+		/* RTL8821Native 2026-11-24: TX rate fixed at DESC 0x30 =
+		 * VHT 1SS MCS4 (58.5 Mbps @20 MHz) at bring-up. Sweep
+		 * verdict (2026-11-25 units audit): auto = 20-25% loss;
+		 * 0x30 = 3.3% at -54 dBm. The old "24M" and "36M" labels
+		 * were MGN codes written into a DESC field: 48 = 0x30 was
+		 * really VHT MCS4, and 72 = 0x48 was VHT 3SS MCS8 — a
+		 * 3-stream rate on a 1x1 radio, 100% loss by construction.
+		 * Throughput cost accepted until the FW-RA feedback chain
+		 * works; knob 6 255 restores auto at runtime. */
+		rtl8814native_set_knob(6, 0x30);
+		rtl_printk("RTL8814Native: TX rate = DESC 0x30 (VHT 1SS MCS4) forced (knob6=0x30)\n");
 
 		/* Coexistence default = data-first TDMA (knob 10 mode 4, 55 ms
 		 * Wi-Fi / 10 ms BT): measured 0% ping loss and fast browsing;
@@ -1149,12 +1151,24 @@ void rtl8814native_note_ccx_report(u8 rate, u8 retry, u8 state)
  * loss-free (measured); engage below -60 dBm, release above -55 dBm.
  * knob 6 (fix_rate) overrides: any manual value clears the cap.
  * When CCX data reports are enabled (knob 11), the counters below feed a
- * future host-side ladder (DrogaBox/rtw88 method). */
+ * future host-side ladder (DrogaBox/rtw88 method).
+ *
+ * UNITS — padapter->fix_rate is a DESC_* rate code, NOT an MGN_* code.
+ * The TX path writes it straight into the 8821C descriptor rate field
+ * (rtl8821cu_xmit.c: SET_TX_DESC_DATARATE_8821C(..., fix_rate & 0x7F))
+ * and the vendor's own iwpriv path converts it out with
+ * hw_rate_to_m_rate(fix_rate) (rtw_debug.c). So:
+ *   0x08 = OFDM 24M      0x30 = VHT 1SS MCS4 (58.5 Mbps @20 MHz)
+ *   0x0a = OFDM 48M      0x48 = VHT 3SS MCS8 -> impossible on 1x1
+ * The Nov-24 "24M" default was 48 decimal = 0x30, i.e. VHT MCS4; the
+ * "36M = 100% loss wall" was 72 decimal = 0x48 = a 3-stream rate on a
+ * 1x1 radio. Keep every value here in DESC space. */
 static volatile int g_rate_cap_active;
-/* RTL8821Native: remembered knob-6 value (boot default 48 = OFDM 24M).
- * Association clobbers fix_rate back to auto; the watchdog re-applies
- * this so the rate-wall protection survives reassociation. */
-static volatile u8 g_fix_rate_default = 48;
+/* RTL8821Native: remembered knob-6 value. Association clobbers fix_rate
+ * back to auto; the watchdog re-applies this so the rate protection
+ * survives reassociation. 0x30 = VHT 1SS MCS4 was the empirically clean
+ * shipped rate (3.3% loss at -54 dBm); it used to be written as "48". */
+static volatile u8 g_fix_rate_default = 0x30;
 
 void rtl8814native_rate_cap_tick(void)
 {
@@ -1171,30 +1185,74 @@ void rtl8814native_rate_cap_tick(void)
 	 * — up when the current rate is clean, down when it fails. The
 	 * ladder owns fix_rate; the RSSI cap is bypassed while active. */
 	if (g_ccx_data_rpt_enable && g_ccx_rpt_cnt > 20) {
-		/* MGN->HW(DESC) code: OFDM6M=4..54M=11, MCS0=12..MCS7=19.
-		 * Walk window [DESC24M(8) .. DESC54M(11)] — conservative. */
-		static const u8 ladder[3] = { 8, 10, 11 };  /* 24M, 48M, 54M */
-		static int idx = 0, stable = 0;
-		u32 ok = g_ccx_rate_ok[ladder[idx]];
-		u32 fail = g_ccx_rate_fail[ladder[idx]];
+		/* DESC rate codes (see the UNITS note above): VHT 1SS
+		 * MCS4..MCS7 = 58.5/65/78/86.7 Mbps @20 MHz. The ladder
+		 * only acts when the current fix_rate is one of these
+		 * rungs; in auto (0xFF) or at a hand-picked off-ladder
+		 * rate the per-rung counters describe nothing we send.
+		 * Counters are WINDOWED (delta since the previous tick):
+		 * the cumulative version latched DOWN forever after the
+		 * first fail anywhere and stepped UP on stale totals. */
+		static const u8 ladder[4] = { 0x30, 0x31, 0x32, 0x33 };
+		static int idx = -1, stable;
+		static u32 w_ok[4], w_fail[4];
+		int cur = -1, i;
+		u32 d_ok, d_fail;
 
-		if (fail == 0 && ok >= 15 && idx < 2) {
+		for (i = 0; i < 4; i++)
+			if (a->fix_rate == ladder[i]) {
+				cur = i;
+				break;
+			}
+		if (cur < 0) {
+			idx = -1;
+			stable = 0;
+			/* association resets fix_rate to auto while the
+			 * ladder is enabled — restore the default, but do
+			 * not fight a deliberate off-ladder knob-6 rate */
+			if (a->fix_rate == 0xFF) {
+				a->fix_rate = (u8)g_fix_rate_default;
+				rtl_printk("RTL8814Native: ladder: fix_rate -> default 0x%02x\n",
+					   (u8)g_fix_rate_default);
+			}
+			return;
+		}
+		if (idx != cur) {
+			/* (re)sync: baseline this rung, act next tick */
+			idx = cur;
+			stable = 0;
+			w_ok[idx] = g_ccx_rate_ok[ladder[idx]];
+			w_fail[idx] = g_ccx_rate_fail[ladder[idx]];
+			return;
+		}
+
+		d_ok = g_ccx_rate_ok[ladder[idx]] - w_ok[idx];
+		d_fail = g_ccx_rate_fail[ladder[idx]] - w_fail[idx];
+		w_ok[idx] = g_ccx_rate_ok[ladder[idx]];
+		w_fail[idx] = g_ccx_rate_fail[ladder[idx]];
+
+		if (d_fail == 0 && d_ok >= 10 && idx < 3) {
 			stable++;
 			if (stable >= 3) {           /* ~3 clean windows */
 				idx++;
 				stable = 0;
-				a->fix_rate = hw_rate_to_m_rate(ladder[idx]);
+				a->fix_rate = ladder[idx];
 				g_rate_cap_active = 1;
-				rtl_printk("RTL8814Native: ccx ladder UP -> hw%d (ok=%u fail=%u)\n",
-					   ladder[idx], ok, fail);
+				/* fresh window on the new rate */
+				w_ok[idx] = g_ccx_rate_ok[ladder[idx]];
+				w_fail[idx] = g_ccx_rate_fail[ladder[idx]];
+				rtl_printk("RTL8814Native: ccx ladder UP -> desc 0x%02x (d_ok=%u d_fail=%u)\n",
+					   ladder[idx], d_ok, d_fail);
 			}
-		} else if (fail > 3 && idx > 0) {
+		} else if (d_fail > 3 && idx > 0) {
 			idx--;
 			stable = 0;
-			a->fix_rate = hw_rate_to_m_rate(ladder[idx]);
-			rtl_printk("RTL8814Native: ccx ladder DOWN -> hw%d (ok=%u fail=%u)\n",
-				   ladder[idx], ok, fail);
-		} else if (ok < 5 && fail == 0) {
+			a->fix_rate = ladder[idx];
+			w_ok[idx] = g_ccx_rate_ok[ladder[idx]];
+			w_fail[idx] = g_ccx_rate_fail[ladder[idx]];
+			rtl_printk("RTL8814Native: ccx ladder DOWN -> desc 0x%02x (d_ok=%u d_fail=%u)\n",
+				   ladder[idx], d_ok, d_fail);
+		} else if (d_ok < 3 && d_fail == 0) {
 			/* quiet window — reset the stability counter */
 			stable = 0;
 		}
@@ -1212,9 +1270,9 @@ void rtl8814native_rate_cap_tick(void)
 	}
 
 	if (!g_rate_cap_active && a->fix_rate == 0xFF && rssi <= -60) {
-		a->fix_rate = MGN_24M;
+		a->fix_rate = 0x08;   /* DESC_RATE24M (not MGN_24M!) */
 		g_rate_cap_active = 1;
-		rtl_printk("RTL8814Native: rate cap ON (rssi %d dBm -> 24M)\n", rssi);
+		rtl_printk("RTL8814Native: rate cap ON (rssi %d dBm -> desc 24M)\n", rssi);
 	} else if (g_rate_cap_active && rssi >= -55) {
 		a->fix_rate = 0xFF;
 		g_rate_cap_active = 0;
@@ -1257,10 +1315,14 @@ int rtl8814native_set_knob(uint32_t knob, uint32_t value){
 		g_rtl_iolog = value;   /* console IOLog gate (debug aid) */
 		return 0;
 	case 6:
-		/* Fixed TX rate (MGN_* code, 0xFF = auto). Discriminates
-		 * "TX fails at high rates" vs "TX fails at all rates":
-		 * e.g. 0x6C = OFDM 54M, 0x02 = CCK 1M. Any manual value
-		 * clears the RSSI rate cap (user override).
+		/* Fixed TX rate — DESC_* code (0xFF = auto), NOT MGN_*.
+		 * The value is written straight into the 8821C TX
+		 * descriptor rate field (rtl8821cu_xmit.c). Useful codes:
+		 * 0x08 OFDM 24M, 0x1b HT MCS7, 0x30 VHT 1SS MCS4 (shipped),
+		 * 0x33 VHT 1SS MCS7, 0xFF auto. Do NOT pass 0x48 — that is
+		 * VHT 3SS MCS8 and a 1x1 radio cannot send it (100% loss;
+		 * this was mislabeled "36M" in the Nov-24 sweep).
+		 * Any manual value clears the RSSI rate cap (user override).
 		 * RTL8821Native 2026-11-24: association CLOBBERS fix_rate
 		 * back to auto (measured: boot default 48 lost after join ->
 		 * baseline 28% loss; the explicit knob6=48 stage measured
@@ -1269,7 +1331,7 @@ int rtl8814native_set_knob(uint32_t knob, uint32_t value){
 		g_padapter->fix_rate = (u8)value;
 		g_fix_rate_default = (u8)value;
 		g_rate_cap_active = 0;
-		rtl_printk("RTL8814Native: knob6 fix_rate=0x%02x (rate cap cleared)\n", (u8)value);
+		rtl_printk("RTL8814Native: knob6 fix_rate=0x%02x DESC (rate cap cleared)\n", (u8)value);
 		return 0;
 	case 7: {
 		/* Force IQK: bNeedIQK is never set in STA mode (only AP/IBSS/CAC

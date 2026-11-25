@@ -51,18 +51,13 @@ for v in 0 1 2 3; do
 done
 $UC knob 12 0 >/dev/null 2>&1   # restore proven default
 
-log "--- [3] knob 6 sweep (TX rate; 36M=72 skipped below -70 dBm = measured rate wall) ---"
-RSSI=$($UC status 2>/dev/null | awk '/Signal RSSI/ {print $4}')
-for v in 48 72 255; do
-  if [ "$v" = "72" ] && [ -n "$RSSI" ] && [ "$RSSI" -lt -70 ] 2>/dev/null; then
-    log "  (skip knob6=72: RSSI $RSSI dBm <= -70, 36M measured 100% loss there)"
-    continue
-  fi
+log "--- [3] knob 6 sweep (TX rate; DESC codes: 48=0x30 VHT MCS4, 51=0x33 VHT MCS7, 255=auto) ---"
+for v in 48 51 255; do
   $UC knob 6 "$v" >/dev/null 2>&1
   sleep 3
-  ping_loss "knob6=$v (48=24M,72=36M,255=auto)" >/dev/null
+  ping_loss "knob6=$v (48=VHT MCS4,51=VHT MCS7,255=auto)" >/dev/null
 done
-$UC knob 6 255 >/dev/null 2>&1   # restore auto (RSSI cap re-engages)
+$UC knob 6 48 >/dev/null 2>&1     # restore shipped default (DESC 0x30)
 
 log "--- [4] knob 10 coex re-assert (4 = TDMA 55/10 data-first) ---"
 $UC knob 10 4 >/dev/null 2>&1
@@ -76,13 +71,13 @@ cp /tmp/loss_check_bootlog.txt /Users/mac330/loss_check_bootlog_$(date +%Y%m%d_%
 grep -c "RXBAD" /tmp/loss_check_bootlog.txt | tee -a "$OUT"
 
 # restore proven defaults so the sweep never leaves a dead link
-$UC knob 12 0 >/dev/null 2>&1
-$UC knob 6 255 >/dev/null 2>&1
+$UC knob 12 3 >/dev/null 2>&1
+$UC knob 6 48 >/dev/null 2>&1
 $UC knob 10 4 >/dev/null 2>&1
 
 log "=== end ==="
 log "Verdict hints:"
-log "  loss collapses at knob6=48       -> TX-rate wall (blind FW RA); check ccx ladder state"
+log "  loss collapses at knob6=48       -> TX-rate related; check ccx ladder state"
 log "  loss varies wildly with knob12   -> RX parse regression; adopt best value, report to notes"
 log "  loss drops after knob10=4        -> coex was wrong mode"
 log "  stage_dropped climbs in [5]      -> RX drop path still losing frames under load"
