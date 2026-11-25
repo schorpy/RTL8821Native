@@ -27,11 +27,12 @@ uc status 2>/dev/null | grep -E "802.11 Link State|Signal RSSI|Current Channel|T
 log "--- enable CCX TX reports (knob 11 1) ---"
 uc knob 11 1 | tee -a "$OUT"
 
-# 3 x 40 MB attempts; a lossy window can kill one attempt without meaning
+# 3 x 8 MB attempts; a lossy window can kill one attempt without meaning
 # the ladder failed, so keep going and report each.
-URL="https://speed.cloudflare.com/__down?bytes=40000000"
+URL="https://speed.cloudflare.com/__down?bytes=8000000"
+: > "$BOOT.seen"
 for a in 1 2 3; do
-  ( curl -m 45 -o /dev/null -s -w "attempt $a: http=%{http_code} %{speed_download} B/s (%{size_download} bytes)\n" "$URL" >> "$OUT" ) &
+  ( curl -m 30 -o /dev/null -s -w "attempt $a: http=%{http_code} %{speed_download} B/s (%{size_download} bytes)\n" "$URL" >> "$OUT" ) &
   CPID=$!
   for i in $(seq 1 20); do
     LINE=$(uc status 2>/dev/null | grep -E "TX Rate \(FW RA\)" | sed 's/^\[+\][[:space:]]*//')
@@ -51,6 +52,12 @@ done
 log "--- bootlog tail ---"
 uc bootlog > "$BOOT.raw" 2>&1
 grep -aE "ccx ladder|ladder: fix_rate|knob11|watchdog re-applied" "$BOOT.raw" | tail -40 | tee -a "$OUT"
+
+log "--- RX health (the 2026-11-25 fix: RXBAD must trend to zero) ---"
+uc status 2>/dev/null | grep -E "RX Bulk IN URBs|RX Drops|RX Reassembly|C2H by id|rx_ba_tids" | tee -a "$OUT"
+RXBAD_LINES=$(grep -ac "RXBAD#" "$BOOT.raw")
+RXBAD_LAST=$(grep -ao "RXBAD#[0-9]*" "$BOOT.raw" | tail -1)
+log "RXBAD lines in ring: $RXBAD_LINES (last counter: ${RXBAD_LAST#RXBAD#})"
 
 log "--- restore: knob 11 off, knob 6 48 (= DESC 0x30) ---"
 uc knob 11 0 >/dev/null 2>&1

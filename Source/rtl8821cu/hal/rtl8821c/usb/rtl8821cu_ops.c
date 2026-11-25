@@ -55,10 +55,22 @@ static u8 sethwreg(PADAPTER padapter, u8 variable, u8 *val)
 		 * RTL8821Native 2026-11-24 (17): size is a HARD LIMIT that
 		 * cuts the aggregate MID-FRAME (stall capture: 12 truncations/s
 		 * under load = RXBAD #5537->#5793 in 21 s). 16 KB cuts 3x
-		 * less often than 5 KB while staying well under the 32 KB
-		 * URB buffer and still bounded. knob 14 re-tunes at runtime. */
+		 * less often than 5 KB while staying well under the URB
+		 * buffer and still bounded. knob 14 re-tunes at runtime.
+		 * RTL8821Native 2026-11-25: the "32 KB URB buffer" assumption
+		 * was wrong — MAX_RECVBUF_SZ was 15360, so a 16 KB aggregate
+		 * overran the URB on EVERY transfer: the bulk-download
+		 * collapse to 0 B/s while pings stayed clean (2026-11-25
+		 * 07:44 ladder run: 3 x 40 MB = 0 bytes, RXBAD ~42/s).
+		 * MAX_RECVBUF_SZ is now 32 KB (mainline rtw88 parity) and
+		 * the size is clamped below it here and in knob 14. */
 		pHalData->rxagg_usb_timeout = 0x20;
 		pHalData->rxagg_usb_size = 0x10;
+		{
+			u8 max_kb = (u8)((MAX_RECVBUF_SZ / 1024) - 2);
+			if (pHalData->rxagg_usb_size > max_kb)
+				pHalData->rxagg_usb_size = max_kb;
+		}
 		rtw_halmac_rx_agg_switch(pdvobjpriv, _TRUE);
 #if 0
 		RTW_INFO("\n==========RAFFIC_STATISTIC==============\n");

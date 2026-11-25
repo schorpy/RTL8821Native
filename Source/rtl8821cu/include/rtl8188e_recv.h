@@ -22,10 +22,18 @@
 #if defined(CONFIG_USB_HCI)
 	#ifndef MAX_RECVBUF_SZ
 		#ifndef CONFIG_MINIMAL_MEMORY_USAGE
-			/* #define MAX_RECVBUF_SZ (32768) */ /* 32k */
+			/* RTL8821Native 2026-11-25: 32 KB (mainline rtw88 value).
+			 * It was 15360 while the RX-agg hard limit is 16 KB, so
+			 * every aggregate the chip built overran the URB buffer,
+			 * the transfer was cut mid-frame, and the next URB began
+			 * on a frame tail — parsed as garbage descriptors (the
+			 * bulk-download collapse to 0 B/s while pings stayed
+			 * clean). Invariant: RX aggregation limit must stay well
+			 * below this, never above it. */
+			#define MAX_RECVBUF_SZ (32768) /* 32k */
 			/* #define MAX_RECVBUF_SZ (16384) */ /* 16K */
 			/* #define MAX_RECVBUF_SZ (10240) */ /* 10K */
-			#define MAX_RECVBUF_SZ (15360) /* 15k < 16k */
+			/* #define MAX_RECVBUF_SZ (15360) */ /* 15k < 16k */
 			/* #define MAX_RECVBUF_SZ (8192+1024) */ /* 8K+1k */
 		#else
 			#define MAX_RECVBUF_SZ (4000) /* about 4K */

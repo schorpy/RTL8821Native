@@ -1445,14 +1445,21 @@ int rtl8814native_set_knob(uint32_t knob, uint32_t value){
 		 * (RXBAD #5537->#5793 in 21 s), each costing a frame + TCP
 		 * retransmit; that is the 65 KB/s-vs-800 KB/s throughput
 		 * killer. Association forces size=5 (5 KB). knob 14 sets a
-		 * bigger hard limit at runtime (8/16/24, max useful < 32 KB
-		 * URB buffer) and re-applies the agg config. 0 = halmac
-		 * default. Timeout untouched (knob 15). */
+		 * bigger hard limit at runtime and re-applies the agg
+		 * config. 0 = halmac default. Timeout untouched (knob 15).
+		 * 2026-11-25: clamp below MAX_RECVBUF_SZ (the URB buffer):
+		 * the old 15360-byte buffer vs 16 KB limit cut EVERY bulk
+		 * transfer and collapsed downloads to 0 B/s. Never allow
+		 * size > buffer/1024 - 2. */
 		HAL_DATA_TYPE *hal = GET_HAL_DATA(g_padapter);
-		hal->rxagg_usb_size = (u8)value;
+		u32 max_kb = (u32)(MAX_RECVBUF_SZ / 1024) - 2;
+		u32 kb = value > max_kb ? max_kb : value;
+
+		hal->rxagg_usb_size = (u8)kb;
 		rtw_halmac_rx_agg_switch(adapter_to_dvobj(g_padapter), _TRUE);
-		rtl_printk("RTL8814Native: knob14 rxagg size=%d KB (AGG_PG_TH=0x%08x)\n",
-			   value, rtw_read32(g_padapter, 0x0280));
+		rtl_printk("RTL8814Native: knob14 rxagg size=%u KB%s (AGG_PG_TH=0x%08x)\n",
+			   kb, kb != value ? " [clamped to URB buffer]" : "",
+			   rtw_read32(g_padapter, 0x0280));
 		return 0;
 	}
 	case 15: {
